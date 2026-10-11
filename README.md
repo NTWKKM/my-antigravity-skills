@@ -15,26 +15,6 @@ Skills can be mounted globally into `~/.gemini/config/skills/` (machine scope) o
 
 ---
 
-## Architecture: Out-of-Band Script Execution vs. Direct Chat Prompts
-
-Executing diagnostic scripts locally rather than inspecting raw transcripts inside chat provides measurable advantages in token economics and data fidelity:
-
-1. **Context Window Protection:**
-   Conversation transcripts are stored as raw JSON Lines files (`transcript.jsonl`) containing tool payloads, process outputs, system instructions, and user messages. Feeding unparsed session logs directly into an LLM context window consumes hundreds of thousands of tokens and causes context window truncation. The bundled scripts parse local sessions out-of-band at zero token cost.
-
-2. **Causal Incident Mining vs. LLM Estimation:**
-   Direct prompting causes the model to guess failure frequencies based on a small sample. The trajectory auditor deterministically evaluates every command step across sessions, measures exact failure percentages, disambiguates benign search queries (`rg`, `grep`, `findstr`, `diff`), reconstructs multi-turn incident chains (`initial command failure -> retries / intervening file writes -> eventual resolution`), and extracts causal resolution vectors by tracking working directory shifts and environment signatures.
-
-3. **Dynamic Git Root Resolution and Session Attribution:**
-   Transcripts are stored by UUID. When IDE synchronization drops workspace headers, raw prompts lose their repository context. The auditor matches UUIDs back to local repositories by parsing workspace declarations, longest common path prefixes from tool arguments (`Cwd`, `TargetFile`, `AbsolutePath`), and dynamic Git root discovery.
-
-4. **Telemetry & Comparative Efficiency Gains:**
-   Deterministic tracking of token burn across prompt, model responses, internal reasoning/thinking, and tool output streams. With `--compare`, users can mathematically evaluate whether previous optimizations reduced failures and token spend or caused drift.
-
-5. **Natural Chat Interface:**
-   The user does not need to execute scripts manually during regular workflows. Asking Antigravity to audit past sessions or check efficiency causes the agent to read `SKILL.md`, invoke the appropriate scripts autonomously, read the compact JSON summaries, and report results.
-
----
 
 ## Included Skills
 
