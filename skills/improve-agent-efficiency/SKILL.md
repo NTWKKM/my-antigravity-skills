@@ -74,7 +74,7 @@ The workflow operates across six distinct phases:
 
    ```pwsh
    # Windows (PowerShell)
-   $SkillScripts = "C:\Users\Amir\.gemini\config\skills\improve-agent-efficiency\scripts"
+   $SkillScripts = "$HOME\.gemini\config\skills\improve-agent-efficiency\scripts"
    py -3.10 "$SkillScripts\audit_trajectories.py" (Get-Location).Path --inventory-only
    ```
 
@@ -101,7 +101,7 @@ Execute both diagnostic tools using the scoped arguments:
 
 ```pwsh
 # Windows (PowerShell)
-$SkillScripts = "C:\Users\Amir\.gemini\config\skills\improve-agent-efficiency\scripts"
+$SkillScripts = "$HOME\.gemini\config\skills\improve-agent-efficiency\scripts"
 py -3.10 "$SkillScripts\probe_environment.py" (Get-Location).Path
 py -3.10 "$SkillScripts\audit_trajectories.py" (Get-Location).Path --since <YYYY-MM-DD> --repo <target_repo>
 ```

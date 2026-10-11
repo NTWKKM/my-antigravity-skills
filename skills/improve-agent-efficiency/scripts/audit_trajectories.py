@@ -540,7 +540,7 @@ def calculate_cohort_summary(conv_list):
     total_user_turns = sum(c["user_turns"] for c in conv_list)
     total_commands = sum(len(c["commands"]) for c in conv_list)
     total_failures = sum(sum(1 for cmd in c["commands"] if cmd["is_failed"]) for c in conv_list)
-    
+
     failures_by_category = Counter()
     failures_by_repo = Counter()
     all_incidents = []

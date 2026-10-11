@@ -11,6 +11,7 @@ Skills can be mounted globally into `~/.gemini/config/skills/` (machine scope) o
 | Skill | Category | Platforms | Supported Stacks | Key Capability |
 | :--- | :--- | :--- | :--- | :--- |
 | [`improve-agent-efficiency`](./skills/improve-agent-efficiency/) | Diagnostics & Auditing | Linux, macOS, Windows | TypeScript/Node, Python, Go, Rust, .NET | Probes live host tooling, mines multi-turn causal incident chains, measures token burn and context metrics, evaluates efficiency gains over time, and synthesizes verified tri-layer remediations. |
+| [`public-repo-safety`](./skills/public-repo-safety/) | Security & Hygiene | Linux, macOS, Windows | Any (Language-agnostic Git & Python scanner) | Audits, scaffolds, and enforces pre-commit hooks and CI safety gates to prevent hardcoded local user paths (Windows C:\\Users, Unix /home), secrets, API keys, and binary blobs from being committed. |
 
 ---
 
@@ -196,3 +197,17 @@ cp -r ./skills/improve-agent-efficiency <project_root>/.agents/skills/
 $dest = "<project_root>\.agents\skills\improve-agent-efficiency"
 Copy-Item -Path ".\skills\improve-agent-efficiency" -Destination $dest -Recurse -Force
 ```
+
+### `public-repo-safety`
+
+An automated security and hygiene runbook for public and open-source repositories. Scaffolds pre-commit interception hooks, portable scanners, and GitHub Actions CI gates to prevent data leakage, user path disclosure, and accidental credential commits.
+
+#### Core Capabilities
+- **Local Path Hygiene:** Detects Windows user paths (`C:\\Users\\...`), Unix user home paths (`/home/...`, `/Users/...`), active username fragments, and local `file:///` URIs.
+- **Credential & Secret Interception:** Flags private key headers, provider API tokens, GitHub personal access tokens, JWT tokens, and unredacted personal email addresses.
+- **Binary Artifact Gate:** Blocks tracking of compiled binaries, objects, and unmanaged archives (`.dll`, `.exe`, `.so`, `.zip`, `.pyc`).
+- **Three-Tier Enforcement:** Deploys a standalone scanner (`scripts/check_repo_safety.py`), local Git hook interception (`.git/hooks/pre-commit`, `.pre-commit-config.yaml`), and GitHub Actions CI verification (`.github/workflows/ci.yml`).
+
+#### Known Limitations & Caveats
+- Requires Python 3.10+ and Git CLI on the host machine.
+- For intentional test fixtures or mock payloads, bypass inspection on specific lines by appending `# nosec` or `# allow-path`.
