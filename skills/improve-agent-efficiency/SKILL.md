@@ -23,6 +23,7 @@ When the user wants to inspect recent performance or verify if previous remediat
 **Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
 
 **Critical Analytical Discipline (Anti-Hallucination Gate):**
+- **Statistical Significance Guards on Labels:** Limit two-proportion $z$-tests and sample-size thresholds ($N \ge 30$) to independent rate/proportion metrics (such as unbounded file view ratio). For continuous token burn and token-distribution metrics, require an appropriate metric-specific significance method (such as conversation-level non-parametric bootstrap); if none is defined or evidence is insufficient, label the result `NEUTRAL`.
 - **Conversation-Level Unit of Analysis (Bootstrap Significance):** Avoid command-level pooling tests ($z$-test on raw command counts) because commands cluster within conversation sessions (intra-cluster correlation / pseudoreplication), yielding artificially optimistic $p$-values. Statistical comparison must be conducted at the conversation level using non-parametric bootstrap (e.g. 1,000 resamples). Differences where 0 falls within the 95% Bootstrap Confidence Interval must be tagged `NEUTRAL`.
 - **Beware of Tail Noise in High Percentiles:** With $N \approx 50$ conversations, the P90 metric represents only ~5 sessions in the extreme tail. Never label P90 reductions as `IMPROVED` or increases as `DRIFT`; tag as `NOISE` or report bootstrap variance. Concurrently, evaluate median shifts against user turn volume (+102% turns/conv directly confounds raw token metrics).
 - **Distinguish Unmodified Re-Reading from Post-Edit Verification:** File overlap re-reading must differentiate between reading lines of an unmodified file (true redundant friction, ~14.7%) vs legitimate post-edit inspection (checking line shifts or verifying diff application, ~30.6% gross). Track modification epochs and reset line sets upon write/replace actions.
@@ -59,7 +60,7 @@ The workflow operates across six distinct phases:
    `scripts/audit_trajectories.py` parses conversation logs, matches sessions to repositories via dynamic git discovery, disambiguates benign zero-match searches (`rg`, `findstr`, `grep`), reconstructs multi-turn incident chains (`initial failed command -> intermediate retries / file writes -> eventual working resolution`), and measures token burn and context metrics.
 
 4. **Targeted Forensic Sampling (Agent Reasoning):**
-   For the highest-friction incident chains, the agent uses bounded `view_file` calls directly on `transcript.jsonl` to inspect the original prompt intent, raw error tracebacks, and tool execution context.
+   For the highest-friction incident chains, the agent uses bounded `view_file` calls directly on `transcript_full.jsonl` (preferring it over `transcript.jsonl` whenever present to avoid truncated tool outputs) to inspect the original prompt intent, raw error tracebacks, and tool execution context.
 
 5. **Tri-Layer Remediation Synthesis (Agent Execution):**
    Interventions are partitioned into Host Tooling (package manager installs), Global Rules (`~/.gemini/config/GEMINI.md`), and Workspace Rules (`<repo_root>/AGENTS.md`).
@@ -224,7 +225,7 @@ When an incident category shows recurring friction (such as process file locks, 
 
 1. Identify the `conversation_id` and `initial_step` from the incident record.
 2. Locate the transcript file at:
-   `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+   `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl` (prefer `transcript_full.jsonl` whenever available to avoid truncated tool outputs; use `transcript.jsonl` only as a fallback when the full transcript is absent).
 3. Execute bounded file inspection around the failure step index to review the exact error stack and model reasoning.
 
 ### Phase 4: Tri-Layer Remediation Deployment

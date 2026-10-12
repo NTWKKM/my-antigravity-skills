@@ -13,9 +13,8 @@ import sys
 import json
 import re
 import platform
-import subprocess
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 import random
 
@@ -269,7 +268,78 @@ def is_benign_command_outcome(cmd, exit_code, resp_content):
     return False
 
 
-def classify_failure(cmd, response_snippet, exit_code):
+INLINE_PREFIXES = (
+    "py -c",
+    "python -c",
+    "python3 -c",
+    "node -e",
+    "bash -c",
+    "powershell -c",
+)
+
+
+def determine_inline_failure_class(cmd_str, resp_content):
+    resp_tail = (
+        resp_content[-2000:] if len(resp_content) > 2000 else (resp_content or "")
+    )
+    resp_lines = [
+        line.strip() for line in (resp_content or "").split("\n") if line.strip()
+    ]
+    last_line = resp_lines[-1] if resp_lines else ""
+
+    if any(
+        k in resp_tail
+        for k in [
+            "ModuleNotFoundError:",
+            "No module named",
+            "Cannot find module",
+            "MODULE_NOT_FOUND",
+            "ImportError:",
+        ]
+    ) or "which uv" in (cmd_str or ""):
+        return "missing_dependency"
+    elif any(
+        k in resp_tail
+        for k in [
+            "SyntaxError:",
+            "parse error",
+            "unterminated string",
+            "unmatched",
+            "bad math expression",
+            "bad pattern",
+            "closing parenthesis",
+            "unexpected character after line continuation",
+            "EOF while scanning",
+        ]
+    ) or any(k in last_line for k in ["zsh:", "bash:"]):
+        return "syntax_shell_parse"
+    elif "AssertionError:" in resp_tail:
+        return "assertion_or_logic"
+    elif (
+        any(
+            k in resp_tail
+            for k in [
+                "KeyError:",
+                "AttributeError:",
+                "IndexError:",
+                "FileNotFoundError:",
+                "ValueError:",
+                "TypeError:",
+                "NameError:",
+                "ZeroDivisionError:",
+                "CalledProcessError",
+                "PatsyError",
+                "Exception:",
+            ]
+        )
+        or "CalledProcessError" in last_line
+    ):
+        return "runtime_exception"
+    else:
+        return "other_failure"
+
+
+def classify_failure(cmd, response_snippet, exit_code, inline_failure_class=None):
     snip = (response_snippet or "").lower()
     cmd_lower = (cmd or "").lower()
 
@@ -277,11 +347,21 @@ def classify_failure(cmd, response_snippet, exit_code):
         k in snip for k in ["failed:", "assertionerror", "test session starts", "fail"]
     ):
         return "Test Assertion / TDD Failure"
-    if any(
-        p in cmd_lower
-        for p in ["py -c", "python -c", "node -e", "bash -c", "powershell -c"]
-    ):
-        return "Inline Script Quoting Collapse"
+    if any(p in cmd_lower for p in INLINE_PREFIXES):
+        if inline_failure_class is None:
+            inline_failure_class = determine_inline_failure_class(
+                cmd, response_snippet or ""
+            )
+        if inline_failure_class == "missing_dependency":
+            return "Missing Python Dependency / Path"
+        elif inline_failure_class == "syntax_shell_parse":
+            return "Inline Script Quoting Collapse"
+        elif inline_failure_class == "assertion_or_logic":
+            return "Test Assertion / TDD Failure"
+        elif inline_failure_class == "runtime_exception":
+            return f"Runtime Execution Failure (Exit Code {exit_code})"
+        else:
+            return "Inline Script Quoting Collapse"
     if "charmap" in snip or "unicodeencodeerror" in snip:
         return "Console Encoding Trap (Non-UTF8 Stream)"
     if any(
@@ -391,22 +471,29 @@ def parse_conversations(
 
             seen_conv_ids.add(item.name)
 
-            # Determine true conversation start time and prompt preview from step 0
+            # Determine true conversation start time and prompt preview from user prompt
             start_dt = None
             first_step_text = ""
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
-                    first_line = f.readline()
-                    if first_line.strip():
-                        d0 = json.loads(first_line)
-                        c_str = d0.get("created_at")
-                        if c_str:
-                            start_dt = (
-                                datetime.fromisoformat(c_str.replace("Z", "+00:00"))
-                                .astimezone()
-                                .replace(tzinfo=None)
-                            )
-                        first_step_text = d0.get("content", "") or ""
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        d0 = json.loads(line_str)
+                        if not start_dt:
+                            c_str = d0.get("created_at")
+                            if c_str:
+                                start_dt = (
+                                    datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                                    .astimezone()
+                                    .replace(tzinfo=None)
+                                )
+                        st = d0.get("type", "")
+                        source = d0.get("source", "")
+                        if st == "USER_INPUT" or source == "USER_EXPLICIT":
+                            first_step_text = d0.get("content", "") or ""
+                            break
             except Exception:
                 pass
 
@@ -462,7 +549,6 @@ def parse_conversations(
         planner_tool_args_chars = 0
         tool_args_chars_by_tool = Counter()
         run_cmd_output_chars = 0
-        other_tool_chars = 0
         file_views_count = 0
         file_views_unbounded = 0
         file_views_bounded = 0
@@ -496,9 +582,9 @@ def parse_conversations(
 
             if "input_tokens" in step:
                 has_api_tokens = True
-                api_input_tokens += step.get("input_tokens", 0)
-                api_cache_read_tokens += step.get("cache_read_tokens", 0)
-                api_output_tokens += step.get("output_tokens", 0)
+                api_input_tokens += step.get("input_tokens") or 0
+                api_cache_read_tokens += step.get("cache_read_tokens") or 0
+                api_output_tokens += step.get("output_tokens") or 0
 
             if st == "USER_INPUT" or source == "USER_EXPLICIT":
                 user_turns_count += 1
@@ -518,7 +604,6 @@ def parse_conversations(
                 user_prompts.append(p_clean[:120])
             elif st == "PLANNER_RESPONSE":
                 planner_prose_chars += len(content)
-                planner_thinking_chars = len(thinking)
                 total_resp_chars += len(content)
                 total_thinking_chars += len(thinking)
                 tcs_step = step.get("tool_calls", [])
@@ -672,10 +757,7 @@ def parse_conversations(
                     ):
                         is_failed = True
 
-                    is_inline = any(
-                        p in cmd_str.lower()
-                        for p in ["py -c", "python -c", "python3 -c", "node -e"]
-                    )
+                    is_inline = any(p in cmd_str.lower() for p in INLINE_PREFIXES)
                     # Genuinely multi-line scripts contain real line breaks
                     is_multiline_inline = is_inline and (
                         "\n" in cmd_str or "\r" in cmd_str
@@ -685,69 +767,9 @@ def parse_conversations(
 
                     inline_failure_class = None
                     if is_inline and is_failed:
-                        resp_tail = (
-                            resp_content[-2000:]
-                            if len(resp_content) > 2000
-                            else resp_content
+                        inline_failure_class = determine_inline_failure_class(
+                            cmd_str, resp_content
                         )
-                        resp_lines = [
-                            l.strip() for l in resp_content.split("\n") if l.strip()
-                        ]
-                        last_line = resp_lines[-1] if resp_lines else ""
-
-                        if (
-                            any(
-                                k in resp_tail
-                                for k in [
-                                    "ModuleNotFoundError:",
-                                    "No module named",
-                                    "Cannot find module",
-                                    "MODULE_NOT_FOUND",
-                                    "ImportError:",
-                                ]
-                            )
-                            or "which uv" in cmd_str
-                        ):
-                            inline_failure_class = "missing_dependency"
-                        elif any(
-                            k in resp_tail
-                            for k in [
-                                "SyntaxError:",
-                                "parse error",
-                                "unterminated string",
-                                "unmatched",
-                                "bad math expression",
-                                "bad pattern",
-                                "closing parenthesis",
-                                "unexpected character after line continuation",
-                                "EOF while scanning",
-                            ]
-                        ) or any(k in last_line for k in ["zsh:", "bash:"]):
-                            inline_failure_class = "syntax_shell_parse"
-                        elif "AssertionError:" in resp_tail:
-                            inline_failure_class = "assertion_or_logic"
-                        elif (
-                            any(
-                                k in resp_tail
-                                for k in [
-                                    "KeyError:",
-                                    "AttributeError:",
-                                    "IndexError:",
-                                    "FileNotFoundError:",
-                                    "ValueError:",
-                                    "TypeError:",
-                                    "NameError:",
-                                    "ZeroDivisionError:",
-                                    "CalledProcessError",
-                                    "PatsyError",
-                                    "Exception:",
-                                ]
-                            )
-                            or "CalledProcessError" in last_line
-                        ):
-                            inline_failure_class = "runtime_exception"
-                        else:
-                            inline_failure_class = "other_failure"
 
                     action_trace.append(
                         {
@@ -823,7 +845,10 @@ def parse_conversations(
             act = action_trace[k]
             if act["is_command"] and act["is_failed"]:
                 cat = classify_failure(
-                    act["command"], act["response_snippet"], act["exit_code"]
+                    act["command"],
+                    act["response_snippet"],
+                    act["exit_code"],
+                    inline_failure_class=act.get("inline_failure_class"),
                 )
                 turn_id = act["turn_index"]
                 incident = {
@@ -969,6 +994,7 @@ def parse_conversations(
                 "api_input_tokens": api_input_tokens,
                 "api_cache_read_tokens": api_cache_read_tokens,
                 "api_output_tokens": api_output_tokens,
+                "has_api_tokens": has_api_tokens,
                 "total_tokens": prompt_tok
                 + resp_tok
                 + think_tok
@@ -1031,16 +1057,16 @@ def calculate_cohort_summary(conv_list):
     for c in conv_list:
         for cmd_entry in c["commands"]:
             cmd = cmd_entry["command"]
-            if any(
-                p in cmd.lower()
-                for p in ["py -c", "python -c", "python3 -c", "node -e"]
-            ):
+            if any(p in cmd.lower() for p in INLINE_PREFIXES):
                 py_c_count += 1
             if re.search(r"\b(grep|cat|rm -rf|ls -la)\b", cmd):
                 bash_syntax_count += 1
             if cmd_entry["is_failed"]:
                 cat = classify_failure(
-                    cmd, cmd_entry["response_snippet"], cmd_entry["exit_code"]
+                    cmd,
+                    cmd_entry["response_snippet"],
+                    cmd_entry["exit_code"],
+                    inline_failure_class=cmd_entry.get("inline_failure_class"),
                 )
                 failures_by_category[cat] += 1
                 failures_by_repo[c["repo_path"]] += 1
@@ -1139,31 +1165,35 @@ def calculate_cohort_summary(conv_list):
         else 0.0
     )
 
+    api_convs = [c for c in conv_list if c.get("has_api_tokens", False)]
+    num_api_convs = len(api_convs)
     total_api_input_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
     total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
     total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
-    has_api_gt = total_api_input_tok > 0 or total_api_cache_read_tok > 0
+    has_api_gt = num_api_convs > 0 and (
+        total_api_input_tok > 0 or total_api_cache_read_tok > 0
+    )
     total_api_context_all = (
         total_api_input_tok + total_api_cache_read_tok + total_api_output_tok
     )
     api_context_per_conv = (
-        round(total_api_context_all / total_convs)
-        if total_convs > 0 and has_api_gt
+        round(total_api_context_all / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
         else None
     )
     api_fresh_per_conv = (
-        round(total_api_input_tok / total_convs)
-        if total_convs > 0 and has_api_gt
+        round(total_api_input_tok / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
         else None
     )
     api_cache_read_per_conv = (
-        round(total_api_cache_read_tok / total_convs)
-        if total_convs > 0 and has_api_gt
+        round(total_api_cache_read_tok / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
         else None
     )
     api_output_per_conv = (
-        round(total_api_output_tok / total_convs)
-        if total_convs > 0 and has_api_gt
+        round(total_api_output_tok / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
         else None
     )
     cache_hit_rate = (
@@ -1182,9 +1212,10 @@ def calculate_cohort_summary(conv_list):
         if has_api_gt and est_output_tokens > 0
         else None
     )
+    api_conv_tokens = sum(c["total_tokens"] for c in api_convs)
     cxt_mag_factor = (
-        round(total_api_context_all / total_tokens, 1)
-        if has_api_gt and total_tokens > 0
+        round(total_api_context_all / api_conv_tokens, 1)
+        if has_api_gt and api_conv_tokens > 0
         else None
     )
 
@@ -1369,7 +1400,11 @@ def bootstrap_conversation_diff(
     if len(t_conv_values) < min_samples or len(b_conv_values) < min_samples:
         return 0.0, 0.0, 1.0, False
     if stat_fn is None:
-        stat_fn = lambda arr: sum(arr) / len(arr) if arr else 0.0
+
+        def default_mean(arr):
+            return sum(arr) / len(arr) if arr else 0.0
+
+        stat_fn = default_mean
 
     rng = random.Random(42)
     diffs = []
@@ -1391,10 +1426,10 @@ def bootstrap_conversation_diff(
     return low, high, p_val, is_significant
 
 
-def is_statistically_significant(c_events, c_total, b_events, b_total, min_events=30):
-    if c_events is None or b_events is None:
+def is_statistically_significant(c_events, c_total, b_events, b_total, min_samples=30):
+    if c_events is None or b_events is None or c_total is None or b_total is None:
         return False
-    if c_events < min_events or b_events < min_events:
+    if c_total < min_samples or b_total < min_samples:
         return False
     if c_total <= 0 or b_total <= 0:
         return False
@@ -1402,6 +1437,10 @@ def is_statistically_significant(c_events, c_total, b_events, b_total, min_event
     p2 = b_events / b_total
     p_pool = (c_events + b_events) / (c_total + b_total)
     if p_pool <= 0 or p_pool >= 1:
+        return False
+    smaller_total = min(c_total, b_total)
+    min_expected_cell = smaller_total * min(p_pool, 1.0 - p_pool)
+    if min_expected_cell < 5:
         return False
     se = (p_pool * (1 - p_pool) * (1 / c_total + 1 / b_total)) ** 0.5
     if se == 0:
@@ -1416,7 +1455,7 @@ def format_delta(
     lower_is_better=True,
     is_pct=False,
     custom_tag=None,
-    is_significant=True,
+    is_significant=False,
 ):
     unit = "%" if is_pct else ""
     if baseline is None or current is None:
@@ -1425,7 +1464,8 @@ def format_delta(
     if baseline == 0:
         if current == 0:
             return f"0{unit} (FLAT)"
-        return f"N/A"
+        val_str = f"{current}{unit}" if current is not None else "N/A"
+        return f"{val_str} (N/A)"
     diff = current - baseline
     pct_change = (diff / baseline) * 100.0
     sign = "+" if diff > 0 else ""
@@ -1503,11 +1543,12 @@ def run_inventory(output_dir=None):
     }
 
     out_dir = Path(output_dir) if output_dir else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "trajectory_inventory.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(inventory_data, f, indent=2)
 
-    print(f"=== Antigravity Rapid Inventory ===")
+    print("=== Antigravity Rapid Inventory ===")
     print(f"Total Conversations Found: {total_convs}")
     print(
         f"Date Range: {inventory_data['earliest_session']} -> {inventory_data['latest_session']}"
@@ -1536,7 +1577,7 @@ def run_audit(
     since_dt = None
     if since_date:
         try:
-            since_dt = datetime.fromisoformat(since_date)
+            since_dt = datetime.fromisoformat(since_date.replace("Z", "+00:00"))
         except Exception:
             try:
                 since_dt = datetime.strptime(since_date, "%Y-%m-%d")
@@ -1544,17 +1585,36 @@ def run_audit(
                 print(
                     f"Warning: Could not parse --since '{since_date}'. Ignoring filter."
                 )
+        if since_dt and since_dt.tzinfo is not None:
+            since_dt = since_dt.astimezone().replace(tzinfo=None)
 
     until_dt = None
     if until_date:
+        is_date_only = False
         try:
-            until_dt = datetime.fromisoformat(until_date)
+            clean_until = until_date.strip()
+            if (
+                len(clean_until) == 10
+                and clean_until.count("-") == 2
+                and "T" not in clean_until
+                and " " not in clean_until
+            ):
+                is_date_only = True
+            until_dt = datetime.fromisoformat(clean_until.replace("Z", "+00:00"))
         except Exception:
             try:
                 until_dt = datetime.strptime(until_date, "%Y-%m-%d")
+                is_date_only = True
             except Exception:
                 print(
                     f"Warning: Could not parse --until '{until_date}'. Ignoring filter."
+                )
+        if until_dt:
+            if until_dt.tzinfo is not None:
+                until_dt = until_dt.astimezone().replace(tzinfo=None)
+            if is_date_only:
+                until_dt = until_dt.replace(
+                    hour=23, minute=59, second=59, microsecond=999999
                 )
 
     if compare_mode and not since_dt:
@@ -1577,7 +1637,7 @@ def run_audit(
         else:
             exclude_conv_list = list(exclude_conv)
 
-    print(f"=== Antigravity Trajectory Auditor ===")
+    print("=== Antigravity Trajectory Auditor ===")
     print(f"Platform: {platform.system()} ({platform.machine()})")
     print(f"Antigravity Data Dir: {base_dir}")
     print(f"Brain Storage Locations: {len(brain_dirs)}")
@@ -1614,6 +1674,7 @@ def run_audit(
     )
 
     out_dir = Path(output_dir) if output_dir else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "trajectory_audit_summary.json"
 
     if compare_mode and since_dt:
@@ -1645,7 +1706,7 @@ def run_audit(
             is_pct=False,
             val_suffix="",
             custom_tag=None,
-            is_significant=True,
+            is_significant=False,
         ):
             delta_str = format_delta(
                 tgt_val,
@@ -1793,6 +1854,13 @@ def run_audit(
             val_suffix="%",
             custom_tag="NEUTRAL",
         )
+        sig_unbounded = is_statistically_significant(
+            target_summary["unbounded_views"],
+            target_summary["file_views"],
+            baseline_summary["unbounded_views"],
+            baseline_summary["file_views"],
+            min_samples=30,
+        )
         print_row(
             "Unbounded File Views (%)",
             baseline_summary["unbounded_view_pct"],
@@ -1800,6 +1868,7 @@ def run_audit(
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_unbounded,
         )
         print_row(
             "Unmodified Re-read Overlap (%)",
@@ -1829,6 +1898,25 @@ def run_audit(
         tgt_api = target_summary.get("api_tokens_ground_truth", {})
         b_cache = base_api.get("cache_hit_rate_pct")
         t_cache = tgt_api.get("cache_hit_rate_pct")
+        tgt_cache_tot = (tgt_api.get("input_tokens_fresh") or 0) + (
+            tgt_api.get("cache_read_tokens") or 0
+        )
+        base_cache_tot = (base_api.get("input_tokens_fresh") or 0) + (
+            base_api.get("cache_read_tokens") or 0
+        )
+        sig_cache = is_statistically_significant(
+            tgt_api.get("cache_read_tokens"),
+            tgt_cache_tot,
+            base_api.get("cache_read_tokens"),
+            base_cache_tot,
+            min_samples=30,
+        )
+        sig_api_conv = (
+            len(target_convs) >= 30
+            and len(baseline_convs) >= 30
+            and bool(tgt_api.get("has_ground_truth"))
+            and bool(base_api.get("has_ground_truth"))
+        )
         print_row(
             "Prompt Cache Hit Rate (%)",
             b_cache,
@@ -1836,18 +1924,21 @@ def run_audit(
             lower_is_better=False,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_cache,
         )
         print_row(
             "API Context / Conv (Ground Truth)",
             base_api.get("total_api_per_conv"),
             tgt_api.get("total_api_per_conv"),
             lower_is_better=True,
+            is_significant=sig_api_conv,
         )
         print_row(
             "API Fresh Input / Conv",
             base_api.get("fresh_input_per_conv"),
             tgt_api.get("fresh_input_per_conv"),
             lower_is_better=True,
+            is_significant=sig_api_conv,
         )
         print("-" * 78)
         print_row(
