@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, Counter
+import random
 
 # Ensure UTF-8 output across all environments
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -467,7 +468,11 @@ def parse_conversations(
         file_views_bounded = 0
         file_views_unbounded_chars = 0
         file_views_bounded_chars = 0
-        file_lines_read = defaultdict(list)
+        file_lines_read_gross = defaultdict(list)
+        file_lines_read_epoch = defaultdict(list)
+        epoch_total_lines = 0
+        epoch_unique_lines = 0
+        write_to_file_modes = Counter()
         skills_notice_count = 0
         skills_notice_chars = 0
         user_turns_count = 0
@@ -577,11 +582,31 @@ def parse_conversations(
                                     )
 
                 if tname in ["write_to_file", "replace_file_content"]:
+                    target_f = clean_str(args.get("TargetFile"))
+                    if tname == "write_to_file":
+                        if args.get("Overwrite") is True:
+                            write_to_file_modes["overwrite"] += 1
+                        elif args.get("Append") is True:
+                            write_to_file_modes["append"] += 1
+                        else:
+                            write_to_file_modes["create"] += 1
+
+                    # Flush and reset unmodified epoch for this file
+                    if target_f and target_f in file_lines_read_epoch:
+                        for s_int, e_int in file_lines_read_epoch[target_f]:
+                            epoch_total_lines += max(0, e_int - s_int + 1)
+                        ep_uniq = set()
+                        for s_int, e_int in file_lines_read_epoch[target_f]:
+                            for ln in range(s_int, e_int + 1):
+                                ep_uniq.add(ln)
+                        epoch_unique_lines += len(ep_uniq)
+                        file_lines_read_epoch[target_f] = []
+
                     action_trace.append(
                         {
                             "step_index": i,
                             "tool": tname,
-                            "target_file": clean_str(args.get("TargetFile")),
+                            "target_file": target_f,
                             "is_command": False,
                         }
                     )
@@ -602,7 +627,8 @@ def parse_conversations(
                         try:
                             s_int = int(s_line)
                             e_int = int(e_line)
-                            file_lines_read[t_file].append((s_int, e_int))
+                            file_lines_read_gross[t_file].append((s_int, e_int))
+                            file_lines_read_epoch[t_file].append((s_int, e_int))
                         except Exception:
                             pass
                     else:
@@ -659,36 +685,65 @@ def parse_conversations(
 
                     inline_failure_class = None
                     if is_inline and is_failed:
-                        if any(
-                            k in resp_content
+                        resp_tail = (
+                            resp_content[-2000:]
+                            if len(resp_content) > 2000
+                            else resp_content
+                        )
+                        resp_lines = [
+                            l.strip() for l in resp_content.split("\n") if l.strip()
+                        ]
+                        last_line = resp_lines[-1] if resp_lines else ""
+
+                        if (
+                            any(
+                                k in resp_tail
+                                for k in [
+                                    "ModuleNotFoundError:",
+                                    "No module named",
+                                    "Cannot find module",
+                                    "MODULE_NOT_FOUND",
+                                    "ImportError:",
+                                ]
+                            )
+                            or "which uv" in cmd_str
+                        ):
+                            inline_failure_class = "missing_dependency"
+                        elif any(
+                            k in resp_tail
                             for k in [
                                 "SyntaxError:",
                                 "parse error",
                                 "unterminated string",
                                 "unmatched",
-                                "EOF while scanning",
+                                "bad math expression",
                                 "bad pattern",
+                                "closing parenthesis",
+                                "unexpected character after line continuation",
+                                "EOF while scanning",
                             ]
-                        ):
+                        ) or any(k in last_line for k in ["zsh:", "bash:"]):
                             inline_failure_class = "syntax_shell_parse"
-                        elif any(
-                            k in resp_content
-                            for k in [
-                                "ModuleNotFoundError:",
-                                "No module named",
-                                "ImportError:",
-                            ]
-                        ):
-                            inline_failure_class = "missing_dependency"
-                        elif any(
-                            k in resp_content
-                            for k in [
-                                "KeyError:",
-                                "AttributeError:",
-                                "IndexError:",
-                                "FileNotFoundError:",
-                                "ValueError:",
-                            ]
+                        elif "AssertionError:" in resp_tail:
+                            inline_failure_class = "assertion_or_logic"
+                        elif (
+                            any(
+                                k in resp_tail
+                                for k in [
+                                    "KeyError:",
+                                    "AttributeError:",
+                                    "IndexError:",
+                                    "FileNotFoundError:",
+                                    "ValueError:",
+                                    "TypeError:",
+                                    "NameError:",
+                                    "ZeroDivisionError:",
+                                    "CalledProcessError",
+                                    "PatsyError",
+                                    "Exception:",
+                                ]
+                            )
+                            or "CalledProcessError" in last_line
                         ):
                             inline_failure_class = "runtime_exception"
                         else:
@@ -834,19 +889,37 @@ def parse_conversations(
             0, tool_tok - (unbounded_view_tok + bounded_view_tok + run_cmd_tok)
         )
 
-        total_view_lines = 0
-        unique_view_lines = 0
-        for fpath_viewed, ranges in file_lines_read.items():
+        # Flush any remaining unmodified epochs
+        for target_f, intervals in file_lines_read_epoch.items():
+            for s_int, e_int in intervals:
+                epoch_total_lines += max(0, e_int - s_int + 1)
+            ep_uniq = set()
+            for s_int, e_int in intervals:
+                for ln in range(s_int, e_int + 1):
+                    ep_uniq.add(ln)
+            epoch_unique_lines += len(ep_uniq)
+
+        # Gross totals across the entire conversation
+        gross_total_lines = 0
+        gross_unique_lines = 0
+        for fpath_viewed, ranges in file_lines_read_gross.items():
             f_unique = set()
             for s_int, e_int in ranges:
-                total_view_lines += max(0, e_int - s_int + 1)
+                gross_total_lines += max(0, e_int - s_int + 1)
                 for ln in range(s_int, e_int + 1):
                     f_unique.add(ln)
-            unique_view_lines += len(f_unique)
-        conv_overlap_lines = max(0, total_view_lines - unique_view_lines)
-        conv_overlap_ratio = (
-            (conv_overlap_lines / total_view_lines * 100)
-            if total_view_lines > 0
+            gross_unique_lines += len(f_unique)
+
+        unmodified_overlap_lines = max(0, epoch_total_lines - epoch_unique_lines)
+        unmodified_overlap_ratio = (
+            (unmodified_overlap_lines / epoch_total_lines * 100)
+            if epoch_total_lines > 0
+            else 0.0
+        )
+        gross_overlap_lines = max(0, gross_total_lines - gross_unique_lines)
+        gross_overlap_ratio = (
+            (gross_overlap_lines / gross_total_lines * 100)
+            if gross_total_lines > 0
             else 0.0
         )
 
@@ -870,16 +943,23 @@ def parse_conversations(
                     tname: round(chars / 4)
                     for tname, chars in tool_args_chars_by_tool.items()
                 },
+                "write_to_file_modes": dict(write_to_file_modes),
                 "thinking_tokens": think_tok,
                 "tool_tokens": tool_tok,
                 "run_cmd_tokens": run_cmd_tok,
                 "unbounded_view_tokens": unbounded_view_tok,
                 "bounded_view_tokens": bounded_view_tok,
                 "other_tool_tokens": other_tool_tok,
-                "total_view_lines": total_view_lines,
-                "unique_view_lines": unique_view_lines,
-                "overlap_lines": conv_overlap_lines,
-                "overlap_ratio_pct": round(conv_overlap_ratio, 2),
+                "total_view_lines": gross_total_lines,
+                "unique_view_lines": gross_unique_lines,
+                "unmodified_view_lines": epoch_total_lines,
+                "unmodified_unique_lines": epoch_unique_lines,
+                "unmodified_overlap_lines": unmodified_overlap_lines,
+                "unmodified_overlap_ratio_pct": round(unmodified_overlap_ratio, 2),
+                "gross_overlap_lines": gross_overlap_lines,
+                "gross_overlap_ratio_pct": round(gross_overlap_ratio, 2),
+                "overlap_lines": unmodified_overlap_lines,
+                "overlap_ratio_pct": round(unmodified_overlap_ratio, 2),
                 "skills_notice_count": skills_notice_count,
                 "skills_notice_tokens": round(skills_notice_chars / 4),
                 "system_tokens": system_tok,
@@ -993,13 +1073,60 @@ def calculate_cohort_summary(conv_list):
         for tname, tok in c.get("tool_args_by_tool", {}).items():
             tool_args_by_tool_totals[tname] += tok
 
-    total_view_lines_all = sum(c.get("total_view_lines", 0) for c in conv_list)
-    unique_view_lines_all = sum(c.get("unique_view_lines", 0) for c in conv_list)
-    overlap_view_lines_all = max(0, total_view_lines_all - unique_view_lines_all)
-    overlap_ratio_all = (
-        round(overlap_view_lines_all / total_view_lines_all * 100, 2)
-        if total_view_lines_all > 0
+    total_unmodified_lines = sum(c.get("unmodified_view_lines", 0) for c in conv_list)
+    unique_unmodified_lines = sum(
+        c.get("unmodified_unique_lines", 0) for c in conv_list
+    )
+    unmodified_overlap_lines = max(0, total_unmodified_lines - unique_unmodified_lines)
+    unmodified_overlap_ratio = (
+        round(unmodified_overlap_lines / total_unmodified_lines * 100, 2)
+        if total_unmodified_lines > 0
         else 0.0
+    )
+
+    total_gross_lines = sum(
+        c.get("gross_view_lines", c.get("total_view_lines", 0)) for c in conv_list
+    )
+    unique_gross_lines = sum(
+        c.get("gross_unique_lines", c.get("unique_view_lines", 0)) for c in conv_list
+    )
+    gross_overlap_lines = max(0, total_gross_lines - unique_gross_lines)
+    gross_overlap_ratio = (
+        round(gross_overlap_lines / total_gross_lines * 100, 2)
+        if total_gross_lines > 0
+        else 0.0
+    )
+
+    write_to_file_totals = Counter()
+    for c in conv_list:
+        write_to_file_totals.update(c.get("write_to_file_modes", {}))
+
+    missing_dep_repos = Counter()
+    missing_dep_convs = Counter()
+    for c in conv_list:
+        for cmd_entry in c["commands"]:
+            if cmd_entry.get("inline_failure_class") == "missing_dependency":
+                repo_name = Path(c["repo_path"]).name if c["repo_path"] else "unknown"
+                missing_dep_repos[repo_name] += 1
+                missing_dep_convs[c["id"][:8]] += 1
+
+    calib_ratios = []
+    for c in conv_list:
+        api_out = c.get("api_output_tokens", 0)
+        est_out = c.get("resp_tokens", 0) + c.get("thinking_tokens", 0)
+        if api_out > 0 and est_out > 0:
+            calib_ratios.append(round(api_out / est_out, 2))
+    calib_spread = (
+        {
+            "mean": round(sum(calib_ratios) / len(calib_ratios), 2),
+            "median": round(quantile(calib_ratios, 0.5), 2),
+            "p25": round(quantile(calib_ratios, 0.25), 2),
+            "p75": round(quantile(calib_ratios, 0.75), 2),
+            "min": min(calib_ratios),
+            "max": max(calib_ratios),
+        }
+        if calib_ratios
+        else None
     )
 
     total_skills_notice_count = sum(c.get("skills_notice_count", 0) for c in conv_list)
@@ -1148,9 +1275,18 @@ def calculate_cohort_summary(conv_list):
         "unbounded_view_tokens": unbounded_view_tok,
         "bounded_view_tokens": bounded_view_tok,
         "file_view_overlap": {
-            "total_view_lines": total_view_lines_all,
-            "unique_view_lines": unique_view_lines_all,
-            "overlap_pct": overlap_ratio_all,
+            "total_unmodified_lines": total_unmodified_lines,
+            "unique_unmodified_lines": unique_unmodified_lines,
+            "unmodified_overlap_pct": unmodified_overlap_ratio,
+            "total_gross_lines": total_gross_lines,
+            "unique_gross_lines": unique_gross_lines,
+            "gross_overlap_pct": gross_overlap_ratio,
+            "overlap_pct": unmodified_overlap_ratio,
+        },
+        "write_to_file_modes": dict(write_to_file_totals),
+        "missing_dependency_details": {
+            "by_repo": dict(missing_dep_repos),
+            "by_conv": dict(missing_dep_convs),
         },
         "total_tokens": total_tokens,
         "prompt_tokens": total_prompt_tok,
@@ -1180,6 +1316,8 @@ def calculate_cohort_summary(conv_list):
             "injections_per_conv": skills_injections_per_conv,
             "injections_per_turn": skills_injections_per_turn,
             "total_tokens": ephemeral_skills_tok,
+            "persistence_model": "per_turn_ephemeral",
+            "retained_in_history": False,
         },
         "api_tokens_ground_truth": {
             "has_ground_truth": has_api_gt,
@@ -1197,6 +1335,7 @@ def calculate_cohort_summary(conv_list):
             "calibration": {
                 "output_token_ratio_api_vs_est": calib_ratio,
                 "context_magnification_factor": cxt_mag_factor,
+                "spread_by_conversation": calib_spread,
             },
         },
         "tokens_per_conv": tokens_per_conv,
@@ -1210,6 +1349,46 @@ def calculate_cohort_summary(conv_list):
         "failures_by_repo": dict(failures_by_repo),
         "high_friction_incidents": high_friction,
     }
+
+
+def bootstrap_conversation_diff(
+    t_conv_values,
+    b_conv_values,
+    stat_fn=None,
+    n_boot=1000,
+    alpha=0.05,
+    min_samples=15,
+):
+    """
+    Computes conversation-level non-parametric bootstrap confidence interval
+    for the difference in statistics between target and baseline cohorts.
+    Returns (low_ci, high_ci, p_val, is_significant).
+    """
+    if not t_conv_values or not b_conv_values:
+        return 0.0, 0.0, 1.0, False
+    if len(t_conv_values) < min_samples or len(b_conv_values) < min_samples:
+        return 0.0, 0.0, 1.0, False
+    if stat_fn is None:
+        stat_fn = lambda arr: sum(arr) / len(arr) if arr else 0.0
+
+    rng = random.Random(42)
+    diffs = []
+    n_t = len(t_conv_values)
+    n_b = len(b_conv_values)
+    for _ in range(n_boot):
+        t_sample = rng.choices(t_conv_values, k=n_t)
+        b_sample = rng.choices(b_conv_values, k=n_b)
+        diffs.append(stat_fn(t_sample) - stat_fn(b_sample))
+    diffs.sort()
+    low_idx = int(n_boot * (alpha / 2))
+    high_idx = int(n_boot * (1 - alpha / 2))
+    low = diffs[low_idx]
+    high = diffs[high_idx]
+    zero_cross = sum(1 for d in diffs if d <= 0) / n_boot
+    p_val = 2 * min(zero_cross, 1 - zero_cross)
+    # Statistically significant only if 0 is strictly outside [low, high]
+    is_significant = not (low <= 0 <= high)
+    return low, high, p_val, is_significant
 
 
 def is_statistically_significant(c_events, c_total, b_events, b_total, min_events=30):
@@ -1480,27 +1659,69 @@ def run_audit(
             t_str = f"{tgt_val}{val_suffix}" if tgt_val is not None else "N/A"
             print(header_fmt.format(label, b_str, t_str, delta_str))
 
-        # Statistical significance guards
-        sig_fail = is_statistically_significant(
-            target_summary["failures"],
-            target_summary["commands"],
-            baseline_summary["failures"],
-            baseline_summary["commands"],
-            min_events=30,
+        # Conversation-level arrays for non-parametric bootstrap testing
+        t_fail_rates = [
+            sum(1 for cmd in c["commands"] if cmd["is_failed"]) / len(c["commands"])
+            if len(c["commands"]) > 0
+            else 0.0
+            for c in target_convs
+        ]
+        b_fail_rates = [
+            sum(1 for cmd in c["commands"] if cmd["is_failed"]) / len(c["commands"])
+            if len(c["commands"]) > 0
+            else 0.0
+            for c in baseline_convs
+        ]
+
+        t_frictions = [
+            len(
+                [
+                    inc
+                    for inc in c["incident_chains"]
+                    if inc["retry_count"] >= 1 or not inc["resolved"]
+                ]
+            )
+            / len(c["commands"])
+            * 100
+            if len(c["commands"]) > 0
+            else 0.0
+            for c in target_convs
+        ]
+        b_frictions = [
+            len(
+                [
+                    inc
+                    for inc in c["incident_chains"]
+                    if inc["retry_count"] >= 1 or not inc["resolved"]
+                ]
+            )
+            / len(c["commands"])
+            * 100
+            if len(c["commands"]) > 0
+            else 0.0
+            for c in baseline_convs
+        ]
+
+        t_tokens = [c["total_tokens"] for c in target_convs]
+        b_tokens = [c["total_tokens"] for c in baseline_convs]
+
+        t_unmod_overlaps = [
+            c.get("unmodified_overlap_ratio_pct", 0.0) for c in target_convs
+        ]
+        b_unmod_overlaps = [
+            c.get("unmodified_overlap_ratio_pct", 0.0) for c in baseline_convs
+        ]
+
+        # Conversation-level non-parametric bootstrap tests (1,000 resamples)
+        _, _, p_fail, sig_fail = bootstrap_conversation_diff(t_fail_rates, b_fail_rates)
+        _, _, p_friction, sig_friction = bootstrap_conversation_diff(
+            t_frictions, b_frictions
         )
-        sig_friction = is_statistically_significant(
-            target_summary["high_friction_count"],
-            target_summary["commands"],
-            baseline_summary["high_friction_count"],
-            baseline_summary["commands"],
-            min_events=30,
+        _, _, p_median_tok, sig_median_tok = bootstrap_conversation_diff(
+            t_tokens, b_tokens, stat_fn=lambda arr: quantile(arr, 0.5)
         )
-        sig_inline = is_statistically_significant(
-            target_summary["py_c_multiline"]["failed"],
-            target_summary["py_c_multiline"]["total"],
-            baseline_summary["py_c_multiline"]["failed"],
-            baseline_summary["py_c_multiline"]["total"],
-            min_events=30,
+        _, _, p_unmod_overlap, sig_unmod_overlap = bootstrap_conversation_diff(
+            t_unmod_overlaps, b_unmod_overlaps
         )
 
         print_row(
@@ -1570,7 +1791,7 @@ def run_audit(
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
-            is_significant=sig_inline,
+            custom_tag="NEUTRAL",
         )
         print_row(
             "Unbounded File Views (%)",
@@ -1581,12 +1802,26 @@ def run_audit(
             val_suffix="%",
         )
         print_row(
-            "File Overlap Re-read (%)",
-            baseline_summary.get("file_view_overlap", {}).get("overlap_pct", 0.0),
-            target_summary.get("file_view_overlap", {}).get("overlap_pct", 0.0),
+            "Unmodified Re-read Overlap (%)",
+            baseline_summary.get("file_view_overlap", {}).get(
+                "unmodified_overlap_pct", 0.0
+            ),
+            target_summary.get("file_view_overlap", {}).get(
+                "unmodified_overlap_pct", 0.0
+            ),
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_unmod_overlap,
+        )
+        print_row(
+            "Gross File Overlap Re-read (%)",
+            baseline_summary.get("file_view_overlap", {}).get("gross_overlap_pct", 0.0),
+            target_summary.get("file_view_overlap", {}).get("gross_overlap_pct", 0.0),
+            lower_is_better=None,
+            is_pct=True,
+            val_suffix="%",
+            custom_tag="RATIO",
         )
         print("-" * 78)
         # Ground-truth API metrics
@@ -1620,18 +1855,21 @@ def run_audit(
             baseline_summary["median_tokens_per_conv"],
             target_summary["median_tokens_per_conv"],
             lower_is_better=True,
+            is_significant=sig_median_tok,
         )
         print_row(
             "Mean Tokens / Conversation",
             baseline_summary["tokens_per_conv"],
             target_summary["tokens_per_conv"],
-            lower_is_better=True,
+            lower_is_better=None,
+            custom_tag="VOLUME",
         )
         print_row(
             "P90 Tokens / Conversation",
             baseline_summary["p90_tokens_per_conv"],
             target_summary["p90_tokens_per_conv"],
-            lower_is_better=True,
+            lower_is_better=None,
+            custom_tag="NOISE",
         )
         print_row(
             "Est. Tokens / User Turn",
@@ -1652,6 +1890,26 @@ def run_audit(
                 "target_window": target_summary,
                 "baseline_window": baseline_summary,
                 "baseline": baseline_summary,
+                "bootstrap_significance_tests": {
+                    "unit_of_analysis": "conversation",
+                    "iterations": 1000,
+                    "failure_rate": {
+                        "p_value": round(p_fail, 4),
+                        "significant": sig_fail,
+                    },
+                    "friction_loops": {
+                        "p_value": round(p_friction, 4),
+                        "significant": sig_friction,
+                    },
+                    "median_tokens": {
+                        "p_value": round(p_median_tok, 4),
+                        "significant": sig_median_tok,
+                    },
+                    "unmodified_overlap": {
+                        "p_value": round(p_unmod_overlap, 4),
+                        "significant": sig_unmod_overlap,
+                    },
+                },
             },
         }
     else:

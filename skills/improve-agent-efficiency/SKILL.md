@@ -23,14 +23,15 @@ When the user wants to inspect recent performance or verify if previous remediat
 **Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
 
 **Critical Analytical Discipline (Anti-Hallucination Gate):**
-- **Statistical Significance Guards on Labels:** Never claim `IMPROVED` or `DRIFT` based on raw directional deltas or small sample sizes. Require minimum event sample size ($n \ge 30$) and two-proportion z-test significance ($z \ge 1.96$, $p < 0.05$). Insignificant differences or low-sample counts must be tagged `NEUTRAL`. Task-granularity indicators (such as `Commands / Turn` or `Inline Scripts / 100 Cmds`) must be tagged `RATIO` or `VOLUME`, never `IMPROVED` or `DRIFT`.
-- **API Ground Truth & Context Magnification:** Cumulative API context tokens (~12.4M tokens/conv) are magnified ~85x compared to unique transcript tokens (~145k tokens/conv) due to multi-turn prefix replay. Prompt caching handles ~93%+ of this context via KV cache. When historical baseline lacks API telemetry, report baseline cache hit rate as `N/A`—never report a spurious jump from `0.0% -> 93.5% (NEW)`. Apply the ~1.53x calibration factor when comparing raw transcript estimates against actual API output tokens.
+- **Conversation-Level Unit of Analysis (Bootstrap Significance):** Avoid command-level pooling tests ($z$-test on raw command counts) because commands cluster within conversation sessions (intra-cluster correlation / pseudoreplication), yielding artificially optimistic $p$-values. Statistical comparison must be conducted at the conversation level using non-parametric bootstrap (e.g. 1,000 resamples). Differences where 0 falls within the 95% Bootstrap Confidence Interval must be tagged `NEUTRAL`.
+- **Beware of Tail Noise in High Percentiles:** With $N \approx 50$ conversations, the P90 metric represents only ~5 sessions in the extreme tail. Never label P90 reductions as `IMPROVED` or increases as `DRIFT`; tag as `NOISE` or report bootstrap variance. Concurrently, evaluate median shifts against user turn volume (+102% turns/conv directly confounds raw token metrics).
+- **Distinguish Unmodified Re-Reading from Post-Edit Verification:** File overlap re-reading must differentiate between reading lines of an unmodified file (true redundant friction, ~14.7%) vs legitimate post-edit inspection (checking line shifts or verifying diff application, ~30.6% gross). Track modification epochs and reset line sets upon write/replace actions.
+- **Ephemeral Message Retention & Non-Compounding Context:** `EPHEMERAL_MESSAGE` injections (such as `ACTIVE SKILLS LOADED` from `pre_invocation.py`) are scoped per turn and do not persist in long-term conversation history. Step-by-step delta analysis ($\Delta \text{input\_tokens}$) demonstrates that ephemeral messages do not accumulate quadratically ($O(S^2)$). KV prompt caching absorbs ~93% of context overhead.
+- **Whole-File Overwrite vs Surgical Replacement:** Over 96% of `write_to_file` invocations are whole-file overwrites (`Overwrite: true`), which account for the largest payload share (~38% of tool argument tokens). Differentiate overwrite, append, and create modes to guide surgical edit adoption (`replace_file_content`).
+- **Calibration Spread Across Conversations:** Rather than relying on a single scalar, report the distribution spread (median, IQR, min/max) of API output tokens vs estimated transcript tokens across conversations, and elevate native API telemetry as the primary cost truth.
 - **Log File Selection (`transcript_full.jsonl` vs `transcript.jsonl`):** Trajectory auditing must prefer `transcript_full.jsonl` whenever present. Compact `transcript.jsonl` truncates tool outputs (`"truncated_fields": ["content"]`), causing tool token calculations (such as file views and command outputs) to report misleadingly tiny sizes (~20 chars/call) and producing false-positive efficiency claims.
 - **Decompose Model Response:** Response output tokens must distinguish between visible assistant prose, tool call arguments (e.g. `write_to_file` payloads), and internal reasoning/thinking tokens. A high response volume typically reflects active code generation and large edit payloads, not conversational loquacity.
-- **Verify Attribution & Magnitude Before Diagnosing:** Never attribute high tool token consumption to a single tool (such as `view_file`) without verifying the actual token contribution (`unbounded_view_tokens`, `bounded_view_tokens`, `run_command_tokens`, `system_tokens`) in `trajectory_audit_summary.json`. Measure file re-reading friction (`file_view_overlap`, typically ~30%+) and system overhead (`skills_notice_stats`, e.g. `ACTIVE SKILLS LOADED` recurring injections) before formulating rules.
-- **Normalize by Volume:** Compare rates (e.g. `Friction Loops / 100 Cmds`, `Inline Scripts / 100 Cmds`) rather than raw counts. An increase in raw incidents alongside an increase in total command volume is volume expansion, not quality drift.
-- **Beware of the Denominator Artifact:** A reduction in tokens/turn is only an efficiency gain if median or mean tokens per conversation also decreased. If user turns doubled, tokens/turn drops purely as a mathematical artifact of task granularity.
-- **Empirical Inline Script Classification:** Differentiate multi-line inline scripts (`py -c`, `node -e` with line breaks) from clean one-liners. Categorize failure root causes by stderr (`missing_dependency` / `ModuleNotFoundError` vs `syntax_shell_parse` vs `runtime_exception`). In practice, virtual environment / package isolation causes ~45% of failures, whereas shell quoting syntax accounts for only ~15%. Never assume quoting failure without stderr confirmation.
+- **Empirical Inline Script Classification & Repository Concentration:** Differentiate multi-line inline scripts (`py -c`, `node -e` with line breaks) from clean one-liners. Parse traceback tails (last lines of stderr) to classify all exception types (`missing_dependency`, `runtime_exception`, `syntax_shell_parse`, `assertion_or_logic`). In practice, missing dependencies cluster heavily in specific workspaces (e.g. unpinned virtualenvs), requiring repo-level `AGENTS.md` alignment rather than global shell syntax rules.
 - **Distinguish Intentional Non-Zero Exits:** TDD red-phase test assertions (`pytest` failing before writing code) and polling status (`gh pr checks` exit 8 pending) are normal workflow signals, not execution failures.
 
 ### Mode B: Deep Friction Audit & Tri-Layer Remediation
@@ -159,10 +160,14 @@ Each cohort summary object provides:
 - `inline_per_100_cmds`: Inline `py -c` / `node -e` rate per 100 commands.
 - `py_c_multiline`: `{ "total": N, "failed": N, "fail_pct": Float }` (multi-line scripts with `\n` or `\r`).
 - `py_c_oneline`: `{ "total": N, "failed": N, "fail_pct": Float }` (clean one-line scripts without line breaks).
-- `inline_failures_by_class`: `{ "missing_dependency": N, "syntax_shell_parse": N, "runtime_exception": N, "other_failure": N }`.
+- `inline_failures_by_class`: `{ "missing_dependency": N, "syntax_shell_parse": N, "runtime_exception": N, "assertion_or_logic": N, "other_failure": N }`.
+- `missing_dependency_details`: `{ "by_repo": { "<repo>": N }, "by_conv": { "<conv_id>": N } }`.
+- `write_to_file_modes`: `{ "overwrite": N, "create": N, "append": N }` (tool payload dispatch modes).
 - `unbounded_views`: Total unbounded `view_file` calls.
 - `unbounded_view_pct`: Percentage of file views that were unbounded.
-- `file_view_overlap`: `{ "total_view_lines": N, "unique_view_lines": N, "overlap_pct": Float }` (re-reading friction).
+- `file_view_overlap`:
+  - `total_unmodified_lines`, `unique_unmodified_lines`, `unmodified_overlap_pct`: Re-reading lines of unmodified files (true redundant reading friction).
+  - `total_gross_lines`, `unique_gross_lines`, `gross_overlap_pct`: Total session line union including post-edit verifications.
 - `total_tokens`: Total tokens across all categories.
 - `prompt_tokens`: Tokens from user prompts.
 - `response_tokens`: Total response tokens generated by the model (`visible_prose_tokens` + `tool_call_args_tokens`).
@@ -183,7 +188,7 @@ Each cohort summary object provides:
   - `memory_recall_tokens`: `[MCP MEMORY RECALL: ...]` injections.
   - `system_message_tokens`: `<SYSTEM_MESSAGE>` injections.
   - `other_ephemeral_tokens`: Other runtime notifications.
-- `skills_notice_stats`: `{ "total_injections": N, "injections_per_conv": Float, "injections_per_turn": Float, "total_tokens": N }`.
+- `skills_notice_stats`: `{ "total_injections": N, "injections_per_conv": Float, "injections_per_turn": Float, "total_tokens": N, "persistence_model": "per_turn_ephemeral", "retained_in_history": False }`.
 - `api_tokens_ground_truth`:
   - `has_ground_truth`: Boolean indicating if native API token metrics were recorded.
   - `input_tokens_fresh`: Uncached input tokens.
@@ -191,9 +196,13 @@ Each cohort summary object provides:
   - `output_tokens_model`: Model output tokens.
   - `fresh_input_per_conv`, `cache_read_per_conv`, `total_api_per_conv`: Per-session API context volume.
   - `cache_hit_rate_pct`: Context cache hit ratio (`cache_read / (input + cache_read) * 100`).
-  - `calibration`: `{ "output_token_ratio_api_vs_est": Float, "context_magnification_factor": Float }`.
+  - `calibration`:
+    - `output_token_ratio_api_vs_est`: Aggregate API output vs estimated response ratio.
+    - `context_magnification_factor`: Cumulative context processed vs unique tokens.
+    - `spread_by_conversation`: `{ "mean": Float, "median": Float, "p25": Float, "p75": Float, "min": Float, "max": Float }`.
 - `tokens_per_conv`, `median_tokens_per_conv`, `p90_tokens_per_conv`: Per-session token distribution.
 - `tokens_per_turn`: Ratio of total tokens to user turns (task granularity indicator).
+- `bootstrap_significance_tests`: Conversation-level non-parametric bootstrap results (`failure_rate`, `friction_loops`, `median_tokens`, `unmodified_overlap`).
 - `high_friction_incidents`: Detailed list of multi-step retry chains.
 
 ### Phase 2: Review Diagnostic Outputs
