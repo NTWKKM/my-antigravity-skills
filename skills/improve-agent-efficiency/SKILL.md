@@ -22,6 +22,19 @@ When the user wants to inspect recent performance or verify if previous remediat
 
 **Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
 
+**Critical Analytical Discipline (Anti-Hallucination Gate):**
+- **Statistical Significance Guards on Labels:** Require conversation-level non-parametric bootstrapping for all rate and proportion metrics (such as command failure rate, high-friction loop rate, unbounded file view ratio, unmodified overlap ratio, and prompt cache hit rate) as well as continuous token metrics. Prohibit pooled $z$-tests on raw event counts because events cluster within conversation sessions (intra-cluster correlation / pseudoreplication), yielding artificially optimistic $p$-values. If evidence is insufficient ($N < 15$) or 0 falls within the 95% Bootstrap Confidence Interval, label the result `NEUTRAL`.
+- **Conversation-Level Unit of Analysis (Bootstrap Significance):** Statistical comparison must be conducted at the conversation level using non-parametric bootstrap (e.g. 1,000 resamples) with pooled-ratio statistics for rate metrics and appropriate location statistics (e.g. median) for continuous token burn. Directional labels (`IMPROVED` / `DRIFT`) must only be assigned when the bootstrap confidence interval excludes zero.
+- **Beware of Tail Noise in High Percentiles:** High percentiles like P90 represent only a small fraction of sessions in the extreme tail (e.g. ~5 sessions when $N \approx 50$). Never label P90 shifts as `IMPROVED` or `DRIFT`; tag as `NOISE` or report bootstrap variance. Concurrently, evaluate per-session token shifts against user turn volume, as variations in turns per conversation directly confound raw token metrics.
+- **Distinguish Unmodified Re-Reading from Post-Edit Verification:** File overlap re-reading must differentiate between reading lines of an unmodified file (true redundant reading friction) vs legitimate post-edit inspection (checking line shifts or verifying diff application across modification epochs). Track modification epochs and reset line sets upon write/replace actions to quantify unmodified overlap separately from gross line revisits.
+- **Ephemeral Message Retention & Context Dynamics:** Verify ephemeral message persistence against the dataset by inspecting step-by-step delta analysis ($\Delta \text{input\_tokens}$) across turns. If runtime injections (such as `EPHEMERAL_MESSAGE` or `ACTIVE SKILLS LOADED`) are scoped per turn rather than persisted in conversation history, they will not compound quadratically ($O(S^2)$) across turns. Measure the actual prompt cache hit rate to quantify how much repetitive prompt overhead is absorbed by KV caching in the target environment.
+- **Whole-File Overwrite vs Surgical Replacement:** Measure the distribution of tool payload modes (differentiating `write_to_file` overwrite, append, and create modes against surgical edits via `replace_file_content`). Analyze the proportion of tool argument tokens consumed by whole-file rewrites to determine whether high tool argument volume stems from full-file overwriting rather than conversational output.
+- **Calibration Spread Across Conversations:** Rather than relying on a single scalar, report the distribution spread (median, IQR, min/max) of API output tokens vs estimated transcript tokens across conversations, and elevate native API telemetry as the primary cost truth.
+- **Log File Selection (`transcript_full.jsonl` vs `transcript.jsonl`):** Trajectory auditing must prefer `transcript_full.jsonl` whenever present. Compact `transcript.jsonl` truncates tool outputs (`"truncated_fields": ["content"]`), causing tool token calculations (such as file views and command outputs) to report misleadingly tiny sizes (~20 chars/call) and producing false-positive efficiency claims.
+- **Decompose Model Response:** Response output tokens must distinguish between visible assistant prose, tool call arguments (e.g. `write_to_file` payloads), and internal reasoning/thinking tokens. A high response volume typically reflects active code generation and large edit payloads, not conversational loquacity.
+- **Empirical Inline Script Classification & Repository Concentration:** Differentiate multi-line inline scripts (`py -c`, `node -e` with line breaks) from clean one-liners. Parse traceback tails (last lines of stderr) to classify all exception types (`missing_dependency`, `runtime_exception`, `syntax_shell_parse`, `assertion_or_logic`). In practice, missing dependencies cluster heavily in specific workspaces (e.g. unpinned virtualenvs), requiring repo-level `AGENTS.md` alignment rather than global shell syntax rules.
+- **Distinguish Intentional Non-Zero Exits:** TDD red-phase test assertions (`pytest` failing before writing code) and polling status (`gh pr checks` exit 8 pending) are normal workflow signals, not execution failures.
+
 ### Mode B: Deep Friction Audit & Tri-Layer Remediation
 When the user wants to identify recurring errors, eliminate multi-turn loops, or update configurations:
 - *"Audit my past sessions and optimize agent rules."*
@@ -29,7 +42,7 @@ When the user wants to identify recurring errors, eliminate multi-turn loops, or
 - *"Analyze execution friction across my projects and recommend host tooling fixes."*
 - *"Probe my host environment and identify discrepancies in my agent configuration."*
 
-**Full Remediation Path:** Follow the sequential phases below (Inventory -> Probe -> Deep Audit -> Sampling -> Remediation -> Verification).
+**Full Remediation Path:** Follow the sequential phases below (Inventory -> Probe -> Deep Audit -> Sampling -> Remediation -> Verification). Before proposing any new rule in `GEMINI.md` or `AGENTS.md`, prove with actual transcript sampling that the friction is systematic, recurring, and causes material token/time waste. Avoid speculative rule additions (adhere strictly to YAGNI).
 
 ---
 
@@ -47,7 +60,7 @@ The workflow operates across six distinct phases:
    `scripts/audit_trajectories.py` parses conversation logs, matches sessions to repositories via dynamic git discovery, disambiguates benign zero-match searches (`rg`, `findstr`, `grep`), reconstructs multi-turn incident chains (`initial failed command -> intermediate retries / file writes -> eventual working resolution`), and measures token burn and context metrics.
 
 4. **Targeted Forensic Sampling (Agent Reasoning):**
-   For the highest-friction incident chains, the agent uses bounded `view_file` calls directly on `transcript.jsonl` to inspect the original prompt intent, raw error tracebacks, and tool execution context.
+   For the highest-friction incident chains, the agent uses bounded `view_file` calls directly on `transcript_full.jsonl` (preferring it over `transcript.jsonl` whenever present to avoid truncated tool outputs) to inspect the original prompt intent, raw error tracebacks, and tool execution context.
 
 5. **Tri-Layer Remediation Synthesis (Agent Execution):**
    Interventions are partitioned into Host Tooling (package manager installs), Global Rules (`~/.gemini/config/GEMINI.md`), and Workspace Rules (`<repo_root>/AGENTS.md`).
@@ -115,16 +128,83 @@ python3 "$SkillScripts/audit_trajectories.py" "$(pwd)" --since <YYYY-MM-DD> --re
 
 #### Supported Mining Flags
 - `--since YYYY-MM-DD`: Restrict audit to sessions on or after a specific date. Useful for measuring the impact of recent rule updates.
+- `--until YYYY-MM-DD`: Restrict audit to sessions on or before a specific date/timestamp to freeze the evaluation window.
 - `--compare`: Compare the target time window against baseline history, outputting side-by-side deltas for failure rate, friction loops, token burn per turn/session, and unbounded file view ratios.
 - `--repo <keyword>`: Restrict audit to sessions associated with a specific repository name.
 - `--exclude <name1,name2>`: Exclude specific repositories from the audit.
+- `--exclude-conv <id1,id2>`: Exclude specific conversation IDs from the audit.
+- `--include-audit-sessions`: Include self and audit/meta-evaluation sessions (default: automatically excluded).
 - `--all`: Parse all discovered sessions without conversation count limits.
 - `--limit <N>`: Maximum recent conversations to evaluate (default: 100).
 - `--inventory-only`: Rapid repository inventory scan without parsing transcripts (<2 seconds).
+- `--print-summary`: Print structured JSON summary payload directly to stdout after audit completion for programmatic piping without intermediate disk inspection.
 
 The diagnostic run produces two artifacts in the working directory:
 - `host_environment_probe.json`: Live binary inventory, stdout encoding status, and rule discrepancies.
 - `trajectory_audit_summary.json`: Command failure counts, token burn estimations, repository distribution, and extracted incident chains.
+
+#### Structure & Schema of `trajectory_audit_summary.json`
+
+When `--compare` is active, the JSON root provides:
+- `comparison.target_window`: Cohort metrics post `--since` date.
+- `comparison.baseline_window` (and alias `comparison.baseline`): Cohort metrics prior to `--since` date.
+- `comparison.bootstrap_significance_tests`: Conversation-level non-parametric bootstrap results (`unit_of_analysis`, `iterations`, `failure_rate`, `friction_loops`, `median_tokens`, `unmodified_overlap`, `unbounded_views`, `prompt_cache_hit`, `api_context`, `api_input_tokens`).
+
+Each cohort summary object provides:
+- `conversations`: Total active conversations in the window.
+- `user_turns`: Total user prompts.
+- `turns_per_conv`: Mean turns per conversation.
+- `commands`: Total CLI commands executed.
+- `cmds_per_turn`: Commands normalized per turn.
+- `failures`: Non-benign command failure count.
+- `failure_rate_pct`: True command failure percentage.
+- `friction_per_100_cmds`: High-friction incident rate per 100 commands.
+- `inline_per_100_cmds`: Inline `py -c` / `node -e` rate per 100 commands.
+- `py_c_multiline`: `{ "total": N, "failed": N, "fail_pct": Float }` (multi-line scripts with `\n` or `\r`).
+- `py_c_oneline`: `{ "total": N, "failed": N, "fail_pct": Float }` (clean one-line scripts without line breaks).
+- `inline_failures_by_class`: `{ "missing_dependency": N, "syntax_shell_parse": N, "runtime_exception": N, "assertion_or_logic": N, "other_failure": N }`.
+- `missing_dependency_details`: `{ "by_repo": { "<repo>": N }, "by_conv": { "<conv_id>": N } }`.
+- `write_to_file_modes`: `{ "overwrite": N, "create": N, "append": N }` (tool payload dispatch modes).
+- `unbounded_views`: Total unbounded `view_file` calls.
+- `unbounded_view_pct`: Percentage of file views that were unbounded.
+- `file_view_overlap`:
+  - `total_unmodified_lines`, `unique_unmodified_lines`, `unmodified_overlap_pct`: Re-reading lines of unmodified files (true redundant reading friction).
+  - `total_gross_lines`, `unique_gross_lines`, `gross_overlap_pct`: Total session line union including post-edit verifications.
+- `total_tokens`: Total tokens across all categories.
+- `prompt_tokens`: Tokens from user prompts.
+- `response_tokens`: Total response tokens generated by the model (`visible_prose_tokens` + `tool_call_args_tokens`).
+- `response_breakdown`:
+  - `visible_prose_tokens`: Assistant markdown prose.
+  - `tool_call_args_tokens`: Tool call arguments (file write payloads, edits, commands).
+  - `tool_call_args_by_tool`: Map of argument tokens per tool (`write_to_file`, `replace_file_content`, `run_command`, `view_file`, etc.).
+  - `thinking_tokens`: Model chain-of-thought tokens.
+- `tool_tokens`: Total tool output tokens returned to the model.
+- `tool_breakdown`:
+  - `unbounded_view_tokens`: File view outputs without start/end lines.
+  - `bounded_view_tokens`: File view outputs with line slicing.
+  - `run_command_tokens`: Command stdout/stderr outputs.
+  - `other_tool_tokens`: Outputs from specialized tools (MCP, subagents, etc.).
+- `system_tokens`: Total system / ephemeral injected tokens.
+- `system_breakdown`:
+  - `skills_notice_tokens`: `[ACTIVE SKILLS LOADED: ...]` injections.
+  - `memory_recall_tokens`: `[MCP MEMORY RECALL: ...]` injections.
+  - `system_message_tokens`: `<SYSTEM_MESSAGE>` injections.
+  - `other_ephemeral_tokens`: Other runtime notifications.
+- `skills_notice_stats`: `{ "total_injections": N, "injections_per_conv": Float, "injections_per_turn": Float, "total_tokens": N, "persistence_model": "per_turn_ephemeral", "retained_in_history": False }`.
+- `api_tokens_ground_truth`:
+  - `has_ground_truth`: Boolean indicating if native API token metrics were recorded.
+  - `input_tokens_fresh`: Uncached input tokens.
+  - `cache_read_tokens`: Prompt cache read tokens.
+  - `output_tokens_model`: Model output tokens.
+  - `fresh_input_per_conv`, `cache_read_per_conv`, `total_api_per_conv`: Per-session API context volume.
+  - `cache_hit_rate_pct`: Context cache hit ratio (`cache_read / (input + cache_read) * 100`).
+  - `calibration`:
+    - `output_token_ratio_api_vs_est`: Aggregate API output vs estimated response ratio.
+    - `context_magnification_factor`: Cumulative context processed vs unique tokens.
+    - `spread_by_conversation`: `{ "mean": Float, "median": Float, "p25": Float, "p75": Float, "min": Float, "max": Float }`.
+- `tokens_per_conv`, `median_tokens_per_conv`, `p90_tokens_per_conv`: Per-session token distribution.
+- `tokens_per_turn`: Ratio of total tokens to user turns (task granularity indicator).
+- `high_friction_incidents`: Detailed list of multi-step retry chains.
 
 ### Phase 2: Review Diagnostic Outputs
 
@@ -145,7 +225,7 @@ When an incident category shows recurring friction (such as process file locks, 
 
 1. Identify the `conversation_id` and `initial_step` from the incident record.
 2. Locate the transcript file at:
-   `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`
+   `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl` (prefer `transcript_full.jsonl` whenever available to avoid truncated tool outputs; use `transcript.jsonl` only as a fallback when the full transcript is absent).
 3. Execute bounded file inspection around the failure step index to review the exact error stack and model reasoning.
 
 ### Phase 4: Tri-Layer Remediation Deployment
