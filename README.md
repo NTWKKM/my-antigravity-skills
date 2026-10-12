@@ -10,11 +10,10 @@ Skills can be mounted globally into `~/.gemini/config/skills/` (machine scope) o
 
 | Skill | Category | Platforms | Supported Stacks | Key Capability |
 | :--- | :--- | :--- | :--- | :--- |
-| [`improve-agent-efficiency`](./skills/improve-agent-efficiency/) | Diagnostics & Auditing | Linux, macOS, Windows | TypeScript/Node, Python, Go, Rust, .NET | Probes live host tooling, mines multi-turn causal incident chains, measures token burn and context metrics, evaluates efficiency gains over time, and synthesizes verified tri-layer remediations. |
-| [`public-repo-safety`](./skills/public-repo-safety/) | Security & Hygiene | Linux, macOS, Windows | Any (Language-agnostic Git & Python scanner) | Audits, scaffolds, and enforces pre-commit hooks and CI safety gates to prevent hardcoded local user paths (Windows C:\\Users, Unix /home), secrets, API keys, and binary blobs from being committed. |
+| [`improve-agent-efficiency`](./skills/improve-agent-efficiency/) | Diagnostics & Auditing | Linux, macOS, Windows | TypeScript/Node, Python, Go, Rust, .NET | Probes live host tooling, mines multi-turn causal incident chains, measures native API telemetry and token burn, evaluates comparative gains via bootstrap testing, and deploys verified tri-layer remediations. |
+| [`public-repo-safety`](./skills/public-repo-safety/) | Security & Hygiene | Linux, macOS, Windows | Any (Language-agnostic Git & Python scanner) | Audits, scaffolds, and enforces pre-commit hooks and CI safety gates to prevent hardcoded local user paths (Windows C:\Users, Unix /home), secrets, API keys, and binary blobs from being committed. |
 
 ---
-
 
 ## Included Skills
 
@@ -33,15 +32,17 @@ The skill bundles two standalone Python scripts in `scripts/`:
    - Writes diagnostic output to `host_environment_probe.json`.
 
 2. **Causal Trajectory Auditor (`scripts/audit_trajectories.py`):**
-   - Parses local conversation transcripts across all discovered brain storage locations.
+   - Parses local conversation transcripts across all discovered brain storage locations, automatically preferring uncompressed `transcript_full.jsonl` whenever available to prevent tool truncation skew.
    - **Zero-Match Query Disambiguation:** Distinguishes benign pattern searches (`rg`, `grep`, `findstr`, `diff` exiting with code 1) from actual runtime crashes, eliminating false failure alarms.
-   - **Native Token Burn Telemetry:** Estimates token burn across prompts, model responses, thinking tokens, and tool output streams; tracks bounded vs. unbounded file viewing ratios.
-   - **Comparative Efficiency Mode (`--compare`):** Partitions sessions into target and baseline windows to calculate exact deltas in failure rates, friction loops, and token burn per turn/session.
-   - Reconstructs multi-turn incident chains, tracking initial command failures, subsequent retries, intervening file writes, working-directory shifts (`Cwd`), and eventual working resolutions.
-   - Dynamically resolves Git repository roots from touched file paths.
-   - Features rapid inventory scanning (`--inventory-only`) to discover date boundaries and repository footprints in seconds without parsing transcripts.
-   - Supports temporal filtering (`--since YYYY-MM-DD`), repository targeting (`--repo <keyword>`), and negative filtering (`--exclude <name1,name2>`).
-   - Writes diagnostic output to `trajectory_audit_summary.json` or `trajectory_inventory.json`.
+   - **Conversation-Level Bootstrap Significance (`--compare`):** Evaluates comparative efficiency gains and token burn using 1,000-resample non-parametric cluster bootstrapping with pooled-ratio statistics for rate metrics (failure rate, friction loops, unmodified overlap, unbounded views, prompt cache hit rate) and location statistics for continuous metrics (median tokens, API context volume, API fresh input). Directional outcomes (`IMPROVED` / `DRIFT`) are strictly guarded against intra-cluster pseudoreplication, labeling statistically non-significant variations as `NEUTRAL`.
+   - **Ground-Truth API Token Telemetry:** Extracts native API token counts when available (`input_tokens_fresh`, `cache_read_tokens`, `output_tokens_model`), calculates prompt KV cache hit rates, evaluates context magnification factors, and calibrates estimation ratios against transcript character counts.
+   - **Granular Token & Action Decomposition:** Decomposes response tokens into visible assistant prose, tool call arguments (dispatched across `overwrite`, `append`, and `create` modes), and internal thinking/reasoning tokens; distinguishes true redundant unmodified file re-reading from legitimate post-edit verifications via file modification epoch tracking.
+   - **Empirical Failure Classification:** Distinguishes multi-line inline scripts from clean one-liners (`py -c`, `node -e`), parses stderr tails to classify error classes (`missing_dependency`, `runtime_exception`, `syntax_shell_parse`, `assertion_or_logic`), and identifies workspace-specific dependency clusters.
+   - **Incident Chain Reconstruction:** Reconstructs multi-turn retry chains, tracking initial command failures, intermediate retries, intervening file writes, working-directory shifts (`Cwd`), and eventual resolutions.
+   - **Dynamic Git Root Resolution:** Dynamically maps conversations to repository roots from file paths touched during each session.
+   - **Rapid Inventory Mode (`--inventory-only`):** Enumerates repositories, conversation counts, and temporal boundaries in seconds without parsing transcript bodies.
+   - **Flexible Temporal & Scope Filtering:** Supports start boundaries (`--since`), inclusive end boundaries (`--until`), repository targeting (`--repo`), repository exclusions (`--exclude`), conversation exclusions (`--exclude-conv`), meta-session inclusion (`--include-audit-sessions`), and headless stdout streaming (`--print-summary`).
+   - Writes structured reports to `trajectory_audit_summary.json` or `trajectory_inventory.json`.
 
 #### Two Operational Modes
 
@@ -62,12 +63,28 @@ Executes across six sequential phases:
 1. **Scoping & Discovery Gate:** Run rapid inventory scan (`--inventory-only`) and select scope.
 2. **Host Probe and Trajectory Mining:** Run `probe_environment.py` and `audit_trajectories.py`.
 3. **Diagnostic Output Review:** Inspect `host_environment_probe.json` and high-friction incidents.
-4. **Targeted Forensic Sampling:** Inspect bounded lines in `transcript.jsonl` around failure steps.
+4. **Targeted Forensic Sampling:** Inspect bounded lines in `transcript_full.jsonl` (or fallback `transcript.jsonl`) around failure steps.
 5. **Tri-Layer Remediation Deployment:**
    - **Host Tooling Layer:** Install missing platform binaries via package managers (`winget`, `brew`, `apt`) and configure persistent environment variables (`PYTHONIOENCODING=utf-8`).
    - **Global Rules Layer (`~/.gemini/config/GEMINI.md`):** Correct platform binary declarations, enforce the File-First Execution SOP for multi-line logic, and maintain bounded output rules.
    - **Workspace Rules Layer (`<repo_root>/AGENTS.md`):** Enforce runtime pinning, lockfile policies, build/test commands, and pre-build process termination.
 6. **Verification Gate:** Test all applied changes (`<binary> --version`, builds, and tests) before concluding.
+
+---
+
+### `public-repo-safety`
+
+An automated security and hygiene runbook for public and open-source repositories. Scaffolds pre-commit interception hooks, portable scanners, and GitHub Actions CI gates to prevent data leakage, user path disclosure, and accidental credential commits.
+
+#### Core Capabilities
+- **Local Path Hygiene:** Detects Windows user paths (`C:\Users\...`), Unix user home paths (`/home/...`, `/Users/...`), active username fragments, and local `file:///` URIs.
+- **Credential & Secret Interception:** Flags private key headers, provider API tokens, GitHub personal access tokens, JWT tokens, and unredacted personal email addresses.
+- **Binary Artifact Gate:** Blocks tracking of compiled binaries, objects, and unmanaged archives (`.dll`, `.exe`, `.so`, `.zip`, `.pyc`).
+- **Three-Tier Enforcement:** Deploys a standalone scanner (`scripts/check_repo_safety.py`), local Git hook interception (`.git/hooks/pre-commit`, `.pre-commit-config.yaml`), and GitHub Actions CI verification (`.github/workflows/ci.yml`).
+
+#### Known Limitations & Caveats
+- Requires Python 3.10+ and Git CLI on the host machine.
+- For intentional test fixtures or mock payloads, bypass inspection on specific lines by appending `# nosec` or `# allow-path`.
 
 ---
 
@@ -123,12 +140,16 @@ The `audit_trajectories.py` script supports the following filtering parameters:
 | :--- | :--- | :--- | :--- |
 | `output_dir` | Positional | Current Directory | Target directory for generated JSON reports |
 | `--compare` | Flag | `False` | Compare target window against baseline history and compute efficiency gains / token burn deltas |
-| `--since` | String (`YYYY-MM-DD`) | `None` | Restrict parsing to sessions recorded on or after this date (or start of target window) |
+| `--since` | String (`YYYY-MM-DD` / timestamp) | `None` | Restrict parsing to sessions recorded on or after this date/time (or start of target window) |
+| `--until` | String (`YYYY-MM-DD` / timestamp) | `None` | Restrict parsing to sessions recorded on or before this date/time (inclusive) |
 | `--limit` | Integer | `100` | Maximum number of recent conversations to parse |
 | `--repo` | String | `None` | Filter parsing to sessions matching a repository substring |
 | `--exclude` | String | `None` | Comma-separated list of repository names to exclude from parsing |
+| `--exclude-conv` | String | `None` | Comma-separated list of conversation IDs to exclude from parsing |
+| `--include-audit-sessions` | Flag | `False` | Include self and audit/meta-evaluation sessions (default: excluded) |
 | `--all` | Flag | `False` | Parse all discovered conversations across all storage locations |
 | `--inventory-only` | Flag | `False` | Discover repositories and date boundaries rapidly without parsing transcripts |
+| `--print-summary` | Flag | `False` | Print structured JSON summary payload directly to stdout for headless piping |
 
 The `probe_environment.py` script accepts an optional positional `output_dir` parameter.
 
@@ -140,7 +161,7 @@ The scripts generate structured JSON artifacts in the specified output directory
 | :--- | :--- | :--- |
 | `trajectory_inventory.json` | `audit_trajectories.py --inventory-only` | Total conversation count, earliest/latest session dates, active workspace info, and list of discovered git repositories |
 | `host_environment_probe.json` | `probe_environment.py` | Platform details, Python stream encoding status, installed binary inventory, and configuration discrepancies against `GEMINI.md` |
-| `trajectory_audit_summary.json` | `audit_trajectories.py` | Aggregate command failure metrics, token burn metrics, category breakdowns, resolution vector distributions, comparative gains (with `--compare`), and extracted incident chains |
+| `trajectory_audit_summary.json` | `audit_trajectories.py` | Aggregate command failure metrics, native API tokens, token burn metrics, category breakdowns, resolution vectors, comparative gains (with `--compare`), extracted incident chains, and `comparison.bootstrap_significance_tests` (`failure_rate`, `friction_loops`, `median_tokens`, `unmodified_overlap`, `unbounded_views`, `prompt_cache_hit`, `api_context`, `api_input_tokens`) |
 
 ---
 
@@ -148,46 +169,36 @@ The scripts generate structured JSON artifacts in the specified output directory
 
 ### Global Installation (Machine Scope)
 
-Mount a skill globally so it is available across all workspaces:
+Mount skills globally so they are available across all workspaces:
 
 ```bash
 # macOS & Linux
 mkdir -p ~/.gemini/config/skills
 cp -r ./skills/improve-agent-efficiency ~/.gemini/config/skills/
+cp -r ./skills/public-repo-safety ~/.gemini/config/skills/
 ```
 
 ```pwsh
 # Windows PowerShell
-$dest = "$env:USERPROFILE\.gemini\config\skills\improve-agent-efficiency"
-Copy-Item -Path ".\skills\improve-agent-efficiency" -Destination $dest -Recurse -Force
+$dest = "$env:USERPROFILE\.gemini\config\skills"
+Copy-Item -Path ".\skills\improve-agent-efficiency" -Destination "$dest\improve-agent-efficiency" -Recurse -Force
+Copy-Item -Path ".\skills\public-repo-safety" -Destination "$dest\public-repo-safety" -Recurse -Force
 ```
 
 ### Workspace Installation (Project Scope)
 
-Vendor a skill directly into a repository to share it with a specific project:
+Vendor skills directly into a repository to share them with a specific project:
 
 ```bash
 # macOS & Linux
 mkdir -p <project_root>/.agents/skills
 cp -r ./skills/improve-agent-efficiency <project_root>/.agents/skills/
+cp -r ./skills/public-repo-safety <project_root>/.agents/skills/
 ```
 
 ```pwsh
 # Windows PowerShell
-$dest = "<project_root>\.agents\skills\improve-agent-efficiency"
-Copy-Item -Path ".\skills\improve-agent-efficiency" -Destination $dest -Recurse -Force
+$dest = "<project_root>\.agents\skills"
+Copy-Item -Path ".\skills\improve-agent-efficiency" -Destination "$dest\improve-agent-efficiency" -Recurse -Force
+Copy-Item -Path ".\skills\public-repo-safety" -Destination "$dest\public-repo-safety" -Recurse -Force
 ```
-
-### `public-repo-safety`
-
-An automated security and hygiene runbook for public and open-source repositories. Scaffolds pre-commit interception hooks, portable scanners, and GitHub Actions CI gates to prevent data leakage, user path disclosure, and accidental credential commits.
-
-#### Core Capabilities
-- **Local Path Hygiene:** Detects Windows user paths (`C:\\Users\\...`), Unix user home paths (`/home/...`, `/Users/...`), active username fragments, and local `file:///` URIs.
-- **Credential & Secret Interception:** Flags private key headers, provider API tokens, GitHub personal access tokens, JWT tokens, and unredacted personal email addresses.
-- **Binary Artifact Gate:** Blocks tracking of compiled binaries, objects, and unmanaged archives (`.dll`, `.exe`, `.so`, `.zip`, `.pyc`).
-- **Three-Tier Enforcement:** Deploys a standalone scanner (`scripts/check_repo_safety.py`), local Git hook interception (`.git/hooks/pre-commit`, `.pre-commit-config.yaml`), and GitHub Actions CI verification (`.github/workflows/ci.yml`).
-
-#### Known Limitations & Caveats
-- Requires Python 3.10+ and Git CLI on the host machine.
-- For intentional test fixtures or mock payloads, bypass inspection on specific lines by appending `# nosec` or `# allow-path`.
