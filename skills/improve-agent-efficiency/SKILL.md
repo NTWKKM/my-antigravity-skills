@@ -22,6 +22,12 @@ When the user wants to inspect recent performance or verify if previous remediat
 
 **Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
 
+**Critical Analytical Discipline (Anti-Hallucination Gate):**
+- **Verify Attribution & Magnitude Before Diagnosing:** Never attribute high tool token consumption to a single tool (such as `view_file`) without verifying the actual token contribution (`unbounded_view_tokens`, `bounded_view_tokens`, `system_tokens`) in `trajectory_audit_summary.json`. System streaming overhead (`EPHEMERAL_MESSAGE`) must not be confused with tool execution cost.
+- **Normalize by Volume:** Compare rates (e.g. `Friction Loops / 100 Cmds`, `Inline Scripts / 100 Cmds`) rather than raw counts. An increase in raw incidents alongside an increase in total command volume is volume expansion, not quality drift.
+- **Beware of the Denominator Artifact:** A reduction in tokens/turn is only an efficiency gain if median or mean tokens per conversation also decreased. If user turns doubled, tokens/turn drops purely as a mathematical artifact of task granularity.
+- **Distinguish Intentional Non-Zero Exits:** TDD red-phase test assertions (`pytest` failing before writing code) and polling status (`gh pr checks` exit 8 pending) are normal workflow signals, not execution failures.
+
 ### Mode B: Deep Friction Audit & Tri-Layer Remediation
 When the user wants to identify recurring errors, eliminate multi-turn loops, or update configurations:
 - *"Audit my past sessions and optimize agent rules."*
@@ -29,7 +35,7 @@ When the user wants to identify recurring errors, eliminate multi-turn loops, or
 - *"Analyze execution friction across my projects and recommend host tooling fixes."*
 - *"Probe my host environment and identify discrepancies in my agent configuration."*
 
-**Full Remediation Path:** Follow the sequential phases below (Inventory -> Probe -> Deep Audit -> Sampling -> Remediation -> Verification).
+**Full Remediation Path:** Follow the sequential phases below (Inventory -> Probe -> Deep Audit -> Sampling -> Remediation -> Verification). Before proposing any new rule in `GEMINI.md` or `AGENTS.md`, prove with actual transcript sampling that the friction is systematic, recurring, and causes material token/time waste. Avoid speculative rule additions (adhere strictly to YAGNI).
 
 ---
 
