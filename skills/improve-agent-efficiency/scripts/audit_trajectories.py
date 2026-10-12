@@ -350,8 +350,11 @@ def parse_conversations(
     candidate_repos,
     max_conversations=50,
     since_dt=None,
+    until_dt=None,
     target_repo=None,
     exclude_repo=None,
+    exclude_convs=None,
+    auto_exclude_audit=True,
     compare_mode=False,
 ):
     sorted_repo_norms = sorted(
@@ -364,6 +367,8 @@ def parse_conversations(
     if isinstance(brain_dirs, Path):
         brain_dirs = [brain_dirs]
 
+    exclude_conv_set = set(exclude_convs) if exclude_convs else set()
+
     for brain_dir in brain_dirs:
         if not brain_dir or not brain_dir.exists():
             continue
@@ -373,6 +378,7 @@ def parse_conversations(
                 not item.is_dir()
                 or item.name == "tempmediaStorage"
                 or item.name in seen_conv_ids
+                or item.name in exclude_conv_set
             ):
                 continue
 
@@ -383,15 +389,55 @@ def parse_conversations(
                 continue
 
             seen_conv_ids.add(item.name)
+
+            # Determine true conversation start time and prompt preview from step 0
+            start_dt = None
+            first_step_text = ""
             try:
-                mtime = os.path.getmtime(tpath)
-                conv_dt = datetime.fromtimestamp(mtime)
-                # When comparing, we keep both cohorts (target >= since_dt and baseline < since_dt)
-                if since_dt and not compare_mode and conv_dt < since_dt:
-                    continue
-                conv_candidates.append((mtime, item, tpath, conv_dt))
+                with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+                    first_line = f.readline()
+                    if first_line.strip():
+                        d0 = json.loads(first_line)
+                        c_str = d0.get("created_at")
+                        if c_str:
+                            start_dt = (
+                                datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                                .astimezone()
+                                .replace(tzinfo=None)
+                            )
+                        first_step_text = d0.get("content", "") or ""
             except Exception:
                 pass
+
+            if not start_dt:
+                try:
+                    start_dt = datetime.fromtimestamp(os.path.getmtime(tpath))
+                except Exception:
+                    continue
+
+            # Auto-exclude audit sessions (current active session or sessions executing trajectory audit)
+            if auto_exclude_audit:
+                if item.name == "9594bcbb-d8fb-4482-bb7d-3e80af28a13e":
+                    continue
+                if any(
+                    k in first_step_text
+                    for k in [
+                        "audit_trajectories.py",
+                        "/improve-agent-efficiency",
+                        "improve-agent-efficiency",
+                        "efficiency status และ token burn",
+                    ]
+                ):
+                    continue
+
+            if until_dt and start_dt > until_dt:
+                continue
+
+            # When comparing, we keep both cohorts (target >= since_dt and baseline < since_dt)
+            if since_dt and not compare_mode and start_dt < since_dt:
+                continue
+
+            conv_candidates.append((start_dt.timestamp(), item, tpath, start_dt))
 
     conv_candidates.sort(key=lambda x: x[0], reverse=True)
     total_candidates = len(conv_candidates)
@@ -413,6 +459,7 @@ def parse_conversations(
         total_system_chars = 0
         planner_prose_chars = 0
         planner_tool_args_chars = 0
+        tool_args_chars_by_tool = Counter()
         run_cmd_output_chars = 0
         other_tool_chars = 0
         file_views_count = 0
@@ -420,6 +467,9 @@ def parse_conversations(
         file_views_bounded = 0
         file_views_unbounded_chars = 0
         file_views_bounded_chars = 0
+        file_lines_read = defaultdict(list)
+        skills_notice_count = 0
+        skills_notice_chars = 0
         user_turns_count = 0
         api_input_tokens = 0
         api_cache_read_tokens = 0
@@ -468,11 +518,13 @@ def parse_conversations(
                 total_thinking_chars += len(thinking)
                 tcs_step = step.get("tool_calls", [])
                 for tc_item in tcs_step:
+                    tname_item = tc_item.get("name") or "other"
                     targs = tc_item.get("args") or {}
                     targs_str = (
                         json.dumps(targs) if isinstance(targs, dict) else str(targs)
                     )
                     planner_tool_args_chars += len(targs_str)
+                    tool_args_chars_by_tool[tname_item] += len(targs_str)
             elif st in [
                 "EPHEMERAL_MESSAGE",
                 "SYSTEM_MESSAGE",
@@ -482,6 +534,8 @@ def parse_conversations(
                 total_system_chars += len(content)
                 if "ACTIVE SKILLS LOADED" in content or "ZERO-SLASH MANDATE" in content:
                     ephemeral_by_cat["skills_notice"] += len(content)
+                    skills_notice_count += 1
+                    skills_notice_chars += len(content)
                 elif "MCP MEMORY RECALL" in content or "MEMORY:" in content:
                     ephemeral_by_cat["memory_recall"] += len(content)
                 elif "SYSTEM_MESSAGE" in content:
@@ -544,6 +598,13 @@ def parse_conversations(
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
+                        t_file = clean_str(args.get("AbsolutePath"))
+                        try:
+                            s_int = int(s_line)
+                            e_int = int(e_line)
+                            file_lines_read[t_file].append((s_int, e_int))
+                        except Exception:
+                            pass
                     else:
                         file_views_unbounded += 1
                         file_views_unbounded_chars += v_len
@@ -589,11 +650,49 @@ def parse_conversations(
                         p in cmd_str.lower()
                         for p in ["py -c", "python -c", "python3 -c", "node -e"]
                     )
+                    # Genuinely multi-line scripts contain real line breaks
                     is_multiline_inline = is_inline and (
-                        "\n" in cmd_str or "\\n" in cmd_str or len(cmd_str) > 100
+                        "\n" in cmd_str or "\r" in cmd_str
                     )
                     is_oneline_inline = is_inline and not is_multiline_inline
                     run_cmd_output_chars += len(resp_content)
+
+                    inline_failure_class = None
+                    if is_inline and is_failed:
+                        if any(
+                            k in resp_content
+                            for k in [
+                                "SyntaxError:",
+                                "parse error",
+                                "unterminated string",
+                                "unmatched",
+                                "EOF while scanning",
+                                "bad pattern",
+                            ]
+                        ):
+                            inline_failure_class = "syntax_shell_parse"
+                        elif any(
+                            k in resp_content
+                            for k in [
+                                "ModuleNotFoundError:",
+                                "No module named",
+                                "ImportError:",
+                            ]
+                        ):
+                            inline_failure_class = "missing_dependency"
+                        elif any(
+                            k in resp_content
+                            for k in [
+                                "KeyError:",
+                                "AttributeError:",
+                                "IndexError:",
+                                "FileNotFoundError:",
+                                "ValueError:",
+                            ]
+                        ):
+                            inline_failure_class = "runtime_exception"
+                        else:
+                            inline_failure_class = "other_failure"
 
                     action_trace.append(
                         {
@@ -608,6 +707,7 @@ def parse_conversations(
                             "is_failed": is_failed,
                             "is_multiline_inline": is_multiline_inline,
                             "is_oneline_inline": is_oneline_inline,
+                            "inline_failure_class": inline_failure_class,
                             "response_snippet": resp_content[:500],
                             "is_command": True,
                         }
@@ -734,6 +834,22 @@ def parse_conversations(
             0, tool_tok - (unbounded_view_tok + bounded_view_tok + run_cmd_tok)
         )
 
+        total_view_lines = 0
+        unique_view_lines = 0
+        for fpath_viewed, ranges in file_lines_read.items():
+            f_unique = set()
+            for s_int, e_int in ranges:
+                total_view_lines += max(0, e_int - s_int + 1)
+                for ln in range(s_int, e_int + 1):
+                    f_unique.add(ln)
+            unique_view_lines += len(f_unique)
+        conv_overlap_lines = max(0, total_view_lines - unique_view_lines)
+        conv_overlap_ratio = (
+            (conv_overlap_lines / total_view_lines * 100)
+            if total_view_lines > 0
+            else 0.0
+        )
+
         conversations.append(
             {
                 "id": item.name,
@@ -750,12 +866,22 @@ def parse_conversations(
                 "resp_tokens": resp_tok,
                 "prose_tokens": prose_tok,
                 "tool_args_tokens": tool_args_tok,
+                "tool_args_by_tool": {
+                    tname: round(chars / 4)
+                    for tname, chars in tool_args_chars_by_tool.items()
+                },
                 "thinking_tokens": think_tok,
                 "tool_tokens": tool_tok,
                 "run_cmd_tokens": run_cmd_tok,
                 "unbounded_view_tokens": unbounded_view_tok,
                 "bounded_view_tokens": bounded_view_tok,
                 "other_tool_tokens": other_tool_tok,
+                "total_view_lines": total_view_lines,
+                "unique_view_lines": unique_view_lines,
+                "overlap_lines": conv_overlap_lines,
+                "overlap_ratio_pct": round(conv_overlap_ratio, 2),
+                "skills_notice_count": skills_notice_count,
+                "skills_notice_tokens": round(skills_notice_chars / 4),
                 "system_tokens": system_tok,
                 "ephemeral_breakdown": {
                     k: round(v / 4) for k, v in ephemeral_by_cat.items()
@@ -821,10 +947,14 @@ def calculate_cohort_summary(conv_list):
         if cmd.get("is_oneline_inline") and cmd["is_failed"]
     )
 
+    inline_failures_by_class = Counter()
     for c in conv_list:
         for cmd_entry in c["commands"]:
             cmd = cmd_entry["command"]
-            if any(p in cmd.lower() for p in ["py -c", "python -c", "node -e"]):
+            if any(
+                p in cmd.lower()
+                for p in ["py -c", "python -c", "python3 -c", "node -e"]
+            ):
                 py_c_count += 1
             if re.search(r"\b(grep|cat|rm -rf|ls -la)\b", cmd):
                 bash_syntax_count += 1
@@ -834,6 +964,8 @@ def calculate_cohort_summary(conv_list):
                 )
                 failures_by_category[cat] += 1
                 failures_by_repo[c["repo_path"]] += 1
+                if cmd_entry.get("inline_failure_class"):
+                    inline_failures_by_class[cmd_entry["inline_failure_class"]] += 1
 
         for inc in c["incident_chains"]:
             all_incidents.append(inc)
@@ -856,9 +988,78 @@ def calculate_cohort_summary(conv_list):
     total_system_tok = sum(c.get("system_tokens", 0) for c in conv_list)
     total_tokens = sum(c["total_tokens"] for c in conv_list)
 
+    tool_args_by_tool_totals = Counter()
+    for c in conv_list:
+        for tname, tok in c.get("tool_args_by_tool", {}).items():
+            tool_args_by_tool_totals[tname] += tok
+
+    total_view_lines_all = sum(c.get("total_view_lines", 0) for c in conv_list)
+    unique_view_lines_all = sum(c.get("unique_view_lines", 0) for c in conv_list)
+    overlap_view_lines_all = max(0, total_view_lines_all - unique_view_lines_all)
+    overlap_ratio_all = (
+        round(overlap_view_lines_all / total_view_lines_all * 100, 2)
+        if total_view_lines_all > 0
+        else 0.0
+    )
+
+    total_skills_notice_count = sum(c.get("skills_notice_count", 0) for c in conv_list)
+    skills_injections_per_conv = (
+        round(total_skills_notice_count / total_convs, 1) if total_convs > 0 else 0.0
+    )
+    skills_injections_per_turn = (
+        round(total_skills_notice_count / total_user_turns, 2)
+        if total_user_turns > 0
+        else 0.0
+    )
+
     total_api_input_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
     total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
     total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
+    has_api_gt = total_api_input_tok > 0 or total_api_cache_read_tok > 0
+    total_api_context_all = (
+        total_api_input_tok + total_api_cache_read_tok + total_api_output_tok
+    )
+    api_context_per_conv = (
+        round(total_api_context_all / total_convs)
+        if total_convs > 0 and has_api_gt
+        else None
+    )
+    api_fresh_per_conv = (
+        round(total_api_input_tok / total_convs)
+        if total_convs > 0 and has_api_gt
+        else None
+    )
+    api_cache_read_per_conv = (
+        round(total_api_cache_read_tok / total_convs)
+        if total_convs > 0 and has_api_gt
+        else None
+    )
+    api_output_per_conv = (
+        round(total_api_output_tok / total_convs)
+        if total_convs > 0 and has_api_gt
+        else None
+    )
+    cache_hit_rate = (
+        round(
+            total_api_cache_read_tok
+            / (total_api_input_tok + total_api_cache_read_tok)
+            * 100,
+            2,
+        )
+        if has_api_gt and (total_api_input_tok + total_api_cache_read_tok) > 0
+        else None
+    )
+    est_output_tokens = total_prose_tok + total_tool_args_tok + total_think_tok
+    calib_ratio = (
+        round(total_api_output_tok / est_output_tokens, 2)
+        if has_api_gt and est_output_tokens > 0
+        else None
+    )
+    cxt_mag_factor = (
+        round(total_api_context_all / total_tokens, 1)
+        if has_api_gt and total_tokens > 0
+        else None
+    )
 
     total_views = sum(c["file_views"] for c in conv_list)
     total_unbounded = sum(c["unbounded_views"] for c in conv_list)
@@ -939,18 +1140,25 @@ def calculate_cohort_summary(conv_list):
             if py_c_oneline_total > 0
             else 0.0,
         },
+        "inline_failures_by_class": dict(inline_failures_by_class),
         "bash_syntax": bash_syntax_count,
         "file_views": total_views,
         "unbounded_views": total_unbounded,
         "unbounded_view_pct": round(unbounded_pct, 2),
         "unbounded_view_tokens": unbounded_view_tok,
         "bounded_view_tokens": bounded_view_tok,
+        "file_view_overlap": {
+            "total_view_lines": total_view_lines_all,
+            "unique_view_lines": unique_view_lines_all,
+            "overlap_pct": overlap_ratio_all,
+        },
         "total_tokens": total_tokens,
         "prompt_tokens": total_prompt_tok,
         "response_tokens": total_resp_tok,
         "response_breakdown": {
             "visible_prose_tokens": total_prose_tok,
             "tool_call_args_tokens": total_tool_args_tok,
+            "tool_call_args_by_tool": dict(tool_args_by_tool_totals),
             "thinking_tokens": total_think_tok,
         },
         "tool_tokens": total_tool_tok,
@@ -967,20 +1175,29 @@ def calculate_cohort_summary(conv_list):
             "system_message_tokens": ephemeral_sys_tok,
             "other_ephemeral_tokens": ephemeral_other_tok,
         },
+        "skills_notice_stats": {
+            "total_injections": total_skills_notice_count,
+            "injections_per_conv": skills_injections_per_conv,
+            "injections_per_turn": skills_injections_per_turn,
+            "total_tokens": ephemeral_skills_tok,
+        },
         "api_tokens_ground_truth": {
-            "input_tokens_fresh": total_api_input_tok,
-            "cache_read_tokens": total_api_cache_read_tok,
-            "output_tokens_model": total_api_output_tok,
-            "cache_hit_rate_pct": round(
-                (
-                    total_api_cache_read_tok
-                    / (total_api_input_tok + total_api_cache_read_tok)
-                    * 100
-                ),
-                2,
-            )
-            if (total_api_input_tok + total_api_cache_read_tok) > 0
-            else 0.0,
+            "has_ground_truth": has_api_gt,
+            "input_tokens_fresh": total_api_input_tok if has_api_gt else None,
+            "cache_read_tokens": total_api_cache_read_tok if has_api_gt else None,
+            "output_tokens_model": total_api_output_tok if has_api_gt else None,
+            "total_api_context_processed": total_api_context_all
+            if has_api_gt
+            else None,
+            "fresh_input_per_conv": api_fresh_per_conv,
+            "cache_read_per_conv": api_cache_read_per_conv,
+            "output_per_conv": api_output_per_conv,
+            "total_api_per_conv": api_context_per_conv,
+            "cache_hit_rate_pct": cache_hit_rate,
+            "calibration": {
+                "output_token_ratio_api_vs_est": calib_ratio,
+                "context_magnification_factor": cxt_mag_factor,
+            },
         },
         "tokens_per_conv": tokens_per_conv,
         "median_tokens_per_conv": median_tokens,
@@ -995,15 +1212,41 @@ def calculate_cohort_summary(conv_list):
     }
 
 
+def is_statistically_significant(c_events, c_total, b_events, b_total, min_events=30):
+    if c_events is None or b_events is None:
+        return False
+    if c_events < min_events or b_events < min_events:
+        return False
+    if c_total <= 0 or b_total <= 0:
+        return False
+    p1 = c_events / c_total
+    p2 = b_events / b_total
+    p_pool = (c_events + b_events) / (c_total + b_total)
+    if p_pool <= 0 or p_pool >= 1:
+        return False
+    se = (p_pool * (1 - p_pool) * (1 / c_total + 1 / b_total)) ** 0.5
+    if se == 0:
+        return False
+    z = abs(p1 - p2) / se
+    return z >= 1.96
+
+
 def format_delta(
-    current, baseline, lower_is_better=True, is_pct=False, custom_tag=None
+    current,
+    baseline,
+    lower_is_better=True,
+    is_pct=False,
+    custom_tag=None,
+    is_significant=True,
 ):
     unit = "%" if is_pct else ""
+    if baseline is None or current is None:
+        val_str = f"{current}{unit}" if current is not None else "N/A"
+        return f"{val_str} (N/A)"
     if baseline == 0:
         if current == 0:
             return f"0{unit} (FLAT)"
-        sign = "+" if current > 0 else ""
-        return f"{sign}{current:.2f}{unit} (NEW)"
+        return f"N/A"
     diff = current - baseline
     pct_change = (diff / baseline) * 100.0
     sign = "+" if diff > 0 else ""
@@ -1012,6 +1255,8 @@ def format_delta(
         tag = custom_tag
     elif lower_is_better is None:
         tag = "VOLUME" if diff > 0 else ("FLAT" if diff == 0 else "LOWER")
+    elif not is_significant:
+        tag = "NEUTRAL"
     else:
         improved = (diff < 0) if lower_is_better else (diff > 0)
         tag = "IMPROVED" if improved else ("DRIFT" if diff != 0 else "FLAT")
@@ -1097,8 +1342,11 @@ def run_audit(
     output_dir=None,
     max_conversations=100,
     since_date=None,
+    until_date=None,
     target_repo=None,
     exclude_repo=None,
+    exclude_conv=None,
+    auto_exclude_audit=True,
     compare_mode=False,
     print_summary=False,
 ):
@@ -1118,6 +1366,18 @@ def run_audit(
                     f"Warning: Could not parse --since '{since_date}'. Ignoring filter."
                 )
 
+    until_dt = None
+    if until_date:
+        try:
+            until_dt = datetime.fromisoformat(until_date)
+        except Exception:
+            try:
+                until_dt = datetime.strptime(until_date, "%Y-%m-%d")
+            except Exception:
+                print(
+                    f"Warning: Could not parse --until '{until_date}'. Ignoring filter."
+                )
+
     if compare_mode and not since_dt:
         # Default compare mode to last 24 hours if no since_date passed
         since_dt = datetime.now() - timedelta(hours=24)
@@ -1129,6 +1389,15 @@ def run_audit(
         else:
             exclude_list = list(exclude_repo)
 
+    exclude_conv_list = []
+    if exclude_conv:
+        if isinstance(exclude_conv, str):
+            exclude_conv_list = [
+                c.strip() for c in exclude_conv.split(",") if c.strip()
+            ]
+        else:
+            exclude_conv_list = list(exclude_conv)
+
     print(f"=== Antigravity Trajectory Auditor ===")
     print(f"Platform: {platform.system()} ({platform.machine()})")
     print(f"Antigravity Data Dir: {base_dir}")
@@ -1137,10 +1406,17 @@ def run_audit(
         f"Since Filter: {since_dt.strftime('%Y-%m-%d %H:%M:%S') if since_dt else 'None'}"
     )
     print(
+        f"Until Filter: {until_dt.strftime('%Y-%m-%d %H:%M:%S') if until_dt else 'None'}"
+    )
+    print(
         f"Mode: {'Comparative Efficiency Gains (--compare)' if compare_mode else 'Standard Trajectory Audit'}"
     )
     print(f"Target Repo: {target_repo or 'All'}")
     print(f"Exclude Repos: {', '.join(exclude_list) if exclude_list else 'None'}")
+    print(
+        f"Exclude Convs: {', '.join(exclude_conv_list) if exclude_conv_list else 'None'}"
+    )
+    print(f"Auto-Exclude Audit Sessions: {auto_exclude_audit}")
 
     ide_workspaces = discover_ide_workspaces(ws_storage_dir)
     candidate_repos = discover_git_repositories(ide_workspaces, base_dir)
@@ -1150,8 +1426,11 @@ def run_audit(
         candidate_repos=candidate_repos,
         max_conversations=max_conversations,
         since_dt=since_dt,
+        until_dt=until_dt,
         target_repo=target_repo,
         exclude_repo=exclude_list,
+        exclude_convs=exclude_conv_list,
+        auto_exclude_audit=auto_exclude_audit,
         compare_mode=compare_mode,
     )
 
@@ -1159,7 +1438,7 @@ def run_audit(
     out_file = out_dir / "trajectory_audit_summary.json"
 
     if compare_mode and since_dt:
-        # Partition conversations
+        # Partition conversations by start timestamp
         target_convs = [c for c in all_convs if c["dt"] >= since_dt]
         baseline_convs = [c for c in all_convs if c["dt"] < since_dt]
 
@@ -1187,6 +1466,7 @@ def run_audit(
             is_pct=False,
             val_suffix="",
             custom_tag=None,
+            is_significant=True,
         ):
             delta_str = format_delta(
                 tgt_val,
@@ -1194,10 +1474,34 @@ def run_audit(
                 lower_is_better=lower_is_better,
                 is_pct=is_pct,
                 custom_tag=custom_tag,
+                is_significant=is_significant,
             )
-            b_str = f"{base_val}{val_suffix}"
-            t_str = f"{tgt_val}{val_suffix}"
+            b_str = f"{base_val}{val_suffix}" if base_val is not None else "N/A"
+            t_str = f"{tgt_val}{val_suffix}" if tgt_val is not None else "N/A"
             print(header_fmt.format(label, b_str, t_str, delta_str))
+
+        # Statistical significance guards
+        sig_fail = is_statistically_significant(
+            target_summary["failures"],
+            target_summary["commands"],
+            baseline_summary["failures"],
+            baseline_summary["commands"],
+            min_events=30,
+        )
+        sig_friction = is_statistically_significant(
+            target_summary["high_friction_count"],
+            target_summary["commands"],
+            baseline_summary["high_friction_count"],
+            baseline_summary["commands"],
+            min_events=30,
+        )
+        sig_inline = is_statistically_significant(
+            target_summary["py_c_multiline"]["failed"],
+            target_summary["py_c_multiline"]["total"],
+            baseline_summary["py_c_multiline"]["failed"],
+            baseline_summary["py_c_multiline"]["total"],
+            min_events=30,
+        )
 
         print_row(
             "Active Conversations",
@@ -1216,6 +1520,7 @@ def run_audit(
             baseline_summary["turns_per_conv"],
             target_summary["turns_per_conv"],
             lower_is_better=None,
+            custom_tag="VOLUME",
         )
         print_row(
             "Total Commands Executed",
@@ -1227,7 +1532,8 @@ def run_audit(
             "Commands / Turn (Normalized)",
             baseline_summary["cmds_per_turn"],
             target_summary["cmds_per_turn"],
-            lower_is_better=True,
+            lower_is_better=None,
+            custom_tag="RATIO",
         )
         print("-" * 78)
         print_row(
@@ -1237,6 +1543,7 @@ def run_audit(
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_fail,
         )
         print_row(
             "High-Friction Loops / 100 Cmds",
@@ -1245,14 +1552,25 @@ def run_audit(
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_friction,
         )
         print_row(
-            "Inline py -c / 100 Cmds",
+            "Inline Scripts / 100 Cmds",
             baseline_summary["inline_per_100_cmds"],
             target_summary["inline_per_100_cmds"],
+            lower_is_better=None,
+            is_pct=True,
+            val_suffix="%",
+            custom_tag="RATIO",
+        )
+        print_row(
+            "Multiline py -c Fail Rate (%)",
+            baseline_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
+            target_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
+            is_significant=sig_inline,
         )
         print_row(
             "Unbounded File Views (%)",
@@ -1263,31 +1581,39 @@ def run_audit(
             val_suffix="%",
         )
         print_row(
-            "Multiline py -c Fail Rate (%)",
-            baseline_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
-            target_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
+            "File Overlap Re-read (%)",
+            baseline_summary.get("file_view_overlap", {}).get("overlap_pct", 0.0),
+            target_summary.get("file_view_overlap", {}).get("overlap_pct", 0.0),
             lower_is_better=True,
             is_pct=True,
             val_suffix="%",
         )
-        if (
-            target_summary.get("api_tokens_ground_truth", {}).get(
-                "cache_hit_rate_pct", 0
-            )
-            > 0
-        ):
-            print_row(
-                "Prompt Cache Hit Rate (%)",
-                baseline_summary.get("api_tokens_ground_truth", {}).get(
-                    "cache_hit_rate_pct", 0.0
-                ),
-                target_summary.get("api_tokens_ground_truth", {}).get(
-                    "cache_hit_rate_pct", 0.0
-                ),
-                lower_is_better=False,
-                is_pct=True,
-                val_suffix="%",
-            )
+        print("-" * 78)
+        # Ground-truth API metrics
+        base_api = baseline_summary.get("api_tokens_ground_truth", {})
+        tgt_api = target_summary.get("api_tokens_ground_truth", {})
+        b_cache = base_api.get("cache_hit_rate_pct")
+        t_cache = tgt_api.get("cache_hit_rate_pct")
+        print_row(
+            "Prompt Cache Hit Rate (%)",
+            b_cache,
+            t_cache,
+            lower_is_better=False,
+            is_pct=True,
+            val_suffix="%",
+        )
+        print_row(
+            "API Context / Conv (Ground Truth)",
+            base_api.get("total_api_per_conv"),
+            tgt_api.get("total_api_per_conv"),
+            lower_is_better=True,
+        )
+        print_row(
+            "API Fresh Input / Conv",
+            base_api.get("fresh_input_per_conv"),
+            tgt_api.get("fresh_input_per_conv"),
+            lower_is_better=True,
+        )
         print("-" * 78)
         print_row(
             "Median Tokens / Conversation",
@@ -1311,7 +1637,7 @@ def run_audit(
             "Est. Tokens / User Turn",
             baseline_summary["tokens_per_turn"],
             target_summary["tokens_per_turn"],
-            lower_is_better=True,
+            lower_is_better=None,
             custom_tag="TURNS_RATIO",
         )
         print("-" * 78)
@@ -1320,7 +1646,8 @@ def run_audit(
             "audit_timestamp": datetime.now().isoformat(),
             "platform": platform.system(),
             "mode": "comparative",
-            "since_filter": since_dt.isoformat(),
+            "since_filter": since_dt.isoformat() if since_dt else None,
+            "until_filter": until_dt.isoformat() if until_dt else None,
             "comparison": {
                 "target_window": target_summary,
                 "baseline_window": baseline_summary,
@@ -1402,6 +1729,12 @@ if __name__ == "__main__":
         help="Filter to conversations on or after date (YYYY-MM-DD)",
     )
     parser.add_argument(
+        "--until",
+        type=str,
+        default=None,
+        help="Filter to conversations on or before date/timestamp (YYYY-MM-DD or ISO)",
+    )
+    parser.add_argument(
         "--repo", type=str, default=None, help="Filter to specific repository substring"
     )
     parser.add_argument(
@@ -1409,6 +1742,18 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Comma-separated repository names to exclude",
+    )
+    parser.add_argument(
+        "--exclude-conv",
+        type=str,
+        default=None,
+        help="Comma-separated conversation IDs to exclude from audit",
+    )
+    parser.add_argument(
+        "--include-audit-sessions",
+        action="store_true",
+        default=False,
+        help="Include self and audit/meta-evaluation sessions (default: excluded)",
     )
     parser.add_argument(
         "--inventory-only",
@@ -1435,8 +1780,11 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             max_conversations=conv_limit,
             since_date=args.since,
+            until_date=args.until,
             target_repo=args.repo,
             exclude_repo=args.exclude,
+            exclude_conv=args.exclude_conv,
+            auto_exclude_audit=not args.include_audit_sessions,
             compare_mode=args.compare,
             print_summary=args.print_summary,
         )
