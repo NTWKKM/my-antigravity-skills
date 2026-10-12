@@ -1834,6 +1834,9 @@ def run_audit(
             for c in b_api_convs
         ]
 
+        t_api_fresh = [c.get("api_input_tokens", 0) or 0 for c in t_api_convs]
+        b_api_fresh = [c.get("api_input_tokens", 0) or 0 for c in b_api_convs]
+
         # Conversation-level non-parametric bootstrap tests (1,000 resamples)
         _, _, p_fail, sig_fail = bootstrap_conversation_diff(
             t_fail_pairs, b_fail_pairs, stat_fn=pooled_ratio_stat
@@ -1855,6 +1858,9 @@ def run_audit(
         )
         _, _, p_api_conv, sig_api_conv = bootstrap_conversation_diff(
             t_api_totals, b_api_totals
+        )
+        _, _, p_api_fresh, sig_api_fresh = bootstrap_conversation_diff(
+            t_api_fresh, b_api_fresh
         )
 
         print_row(
@@ -1984,7 +1990,7 @@ def run_audit(
             base_api.get("fresh_input_per_conv"),
             tgt_api.get("fresh_input_per_conv"),
             lower_is_better=True,
-            is_significant=sig_api_conv,
+            is_significant=sig_api_fresh,
         )
         print("-" * 78)
         print_row(
@@ -2057,6 +2063,10 @@ def run_audit(
                     "api_context": {
                         "p_value": round(p_api_conv, 4),
                         "significant": sig_api_conv,
+                    },
+                    "api_input_tokens": {
+                        "p_value": round(p_api_fresh, 4),
+                        "significant": sig_api_fresh,
                     },
                 },
             },
