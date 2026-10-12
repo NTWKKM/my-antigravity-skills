@@ -376,13 +376,15 @@ def parse_conversations(
             ):
                 continue
 
-            tpath = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath_full = item / ".system_generated" / "logs" / "transcript_full.jsonl"
+            tpath_compact = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath = tpath_full if tpath_full.exists() else tpath_compact
             if not tpath.exists():
                 continue
 
             seen_conv_ids.add(item.name)
             try:
-                mtime = os.path.getmtime(item)
+                mtime = os.path.getmtime(tpath)
                 conv_dt = datetime.fromtimestamp(mtime)
                 # When comparing, we keep both cohorts (target >= since_dt and baseline < since_dt)
                 if since_dt and not compare_mode and conv_dt < since_dt:
@@ -409,12 +411,21 @@ def parse_conversations(
         total_thinking_chars = 0
         total_tool_output_chars = 0
         total_system_chars = 0
+        planner_prose_chars = 0
+        planner_tool_args_chars = 0
+        run_cmd_output_chars = 0
+        other_tool_chars = 0
         file_views_count = 0
         file_views_unbounded = 0
         file_views_bounded = 0
         file_views_unbounded_chars = 0
         file_views_bounded_chars = 0
         user_turns_count = 0
+        api_input_tokens = 0
+        api_cache_read_tokens = 0
+        api_output_tokens = 0
+        has_api_tokens = False
+        ephemeral_by_cat = Counter()
 
         try:
             with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
@@ -427,6 +438,12 @@ def parse_conversations(
             source = step.get("source", "")
             content = step.get("content", "") or ""
             thinking = step.get("thinking", "") or ""
+
+            if "input_tokens" in step:
+                has_api_tokens = True
+                api_input_tokens += step.get("input_tokens", 0)
+                api_cache_read_tokens += step.get("cache_read_tokens", 0)
+                api_output_tokens += step.get("output_tokens", 0)
 
             if st == "USER_INPUT" or source == "USER_EXPLICIT":
                 user_turns_count += 1
@@ -445,8 +462,17 @@ def parse_conversations(
                     first_prompt = p_clean[:200]
                 user_prompts.append(p_clean[:120])
             elif st == "PLANNER_RESPONSE":
+                planner_prose_chars += len(content)
+                planner_thinking_chars = len(thinking)
                 total_resp_chars += len(content)
                 total_thinking_chars += len(thinking)
+                tcs_step = step.get("tool_calls", [])
+                for tc_item in tcs_step:
+                    targs = tc_item.get("args") or {}
+                    targs_str = (
+                        json.dumps(targs) if isinstance(targs, dict) else str(targs)
+                    )
+                    planner_tool_args_chars += len(targs_str)
             elif st in [
                 "EPHEMERAL_MESSAGE",
                 "SYSTEM_MESSAGE",
@@ -454,6 +480,14 @@ def parse_conversations(
                 "CONVERSATION_HISTORY",
             ] or source in ["SYSTEM_SDK", "SYSTEM"]:
                 total_system_chars += len(content)
+                if "ACTIVE SKILLS LOADED" in content or "ZERO-SLASH MANDATE" in content:
+                    ephemeral_by_cat["skills_notice"] += len(content)
+                elif "MCP MEMORY RECALL" in content or "MEMORY:" in content:
+                    ephemeral_by_cat["memory_recall"] += len(content)
+                elif "SYSTEM_MESSAGE" in content:
+                    ephemeral_by_cat["system_message"] += len(content)
+                else:
+                    ephemeral_by_cat["other_ephemeral"] += len(content)
             else:
                 total_tool_output_chars += len(content)
 
@@ -465,7 +499,7 @@ def parse_conversations(
                             active_ws = norm_path(cand)
 
             tc_list = step.get("tool_calls", [])
-            for tc in tc_list:
+            for tc_idx, tc in enumerate(tc_list):
                 tname = tc.get("name")
                 args = tc.get("args") or tc.get("arguments") or {}
                 if not isinstance(args, dict):
@@ -504,8 +538,9 @@ def parse_conversations(
                     e_line = args.get("EndLine")
                     is_bounded = s_line is not None and e_line is not None
                     v_len = 0
-                    if i + 1 < len(steps):
-                        v_len = len(steps[i + 1].get("content", "") or "")
+                    t_idx = i + tc_idx + 1
+                    if t_idx < len(steps):
+                        v_len = len(steps[t_idx].get("content", "") or "")
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
@@ -516,7 +551,7 @@ def parse_conversations(
                 elif tname == "run_command":
                     exit_code = None
                     resp_content = ""
-                    for j in range(i + 1, min(i + 4, len(steps))):
+                    for j in range(i + tc_idx + 1, min(i + tc_idx + 4, len(steps))):
                         m_content = steps[j].get("content", "")
                         if (
                             "exited with code" in m_content
@@ -550,6 +585,16 @@ def parse_conversations(
                     ):
                         is_failed = True
 
+                    is_inline = any(
+                        p in cmd_str.lower()
+                        for p in ["py -c", "python -c", "python3 -c", "node -e"]
+                    )
+                    is_multiline_inline = is_inline and (
+                        "\n" in cmd_str or "\\n" in cmd_str or len(cmd_str) > 100
+                    )
+                    is_oneline_inline = is_inline and not is_multiline_inline
+                    run_cmd_output_chars += len(resp_content)
+
                     action_trace.append(
                         {
                             "step_index": i,
@@ -561,6 +606,8 @@ def parse_conversations(
                             "action": clean_str(args.get("toolAction")),
                             "exit_code": exit_code,
                             "is_failed": is_failed,
+                            "is_multiline_inline": is_multiline_inline,
+                            "is_oneline_inline": is_oneline_inline,
                             "response_snippet": resp_content[:500],
                             "is_command": True,
                         }
@@ -674,12 +721,18 @@ def parse_conversations(
             k += 1
 
         prompt_tok = round(total_prompt_chars / 4)
-        resp_tok = round(total_resp_chars / 4)
+        prose_tok = round(planner_prose_chars / 4)
+        tool_args_tok = round(planner_tool_args_chars / 4)
+        resp_tok = prose_tok + tool_args_tok
         think_tok = round(total_thinking_chars / 4)
         tool_tok = round(total_tool_output_chars / 4)
         system_tok = round(total_system_chars / 4)
         unbounded_view_tok = round(file_views_unbounded_chars / 4)
         bounded_view_tok = round(file_views_bounded_chars / 4)
+        run_cmd_tok = round(run_cmd_output_chars / 4)
+        other_tool_tok = max(
+            0, tool_tok - (unbounded_view_tok + bounded_view_tok + run_cmd_tok)
+        )
 
         conversations.append(
             {
@@ -695,9 +748,21 @@ def parse_conversations(
                 "user_turns": user_turns_count,
                 "prompt_tokens": prompt_tok,
                 "resp_tokens": resp_tok,
+                "prose_tokens": prose_tok,
+                "tool_args_tokens": tool_args_tok,
                 "thinking_tokens": think_tok,
                 "tool_tokens": tool_tok,
+                "run_cmd_tokens": run_cmd_tok,
+                "unbounded_view_tokens": unbounded_view_tok,
+                "bounded_view_tokens": bounded_view_tok,
+                "other_tool_tokens": other_tool_tok,
                 "system_tokens": system_tok,
+                "ephemeral_breakdown": {
+                    k: round(v / 4) for k, v in ephemeral_by_cat.items()
+                },
+                "api_input_tokens": api_input_tokens,
+                "api_cache_read_tokens": api_cache_read_tokens,
+                "api_output_tokens": api_output_tokens,
                 "total_tokens": prompt_tok
                 + resp_tok
                 + think_tok
@@ -706,8 +771,6 @@ def parse_conversations(
                 "file_views": file_views_count,
                 "unbounded_views": file_views_unbounded,
                 "bounded_views": file_views_bounded,
-                "unbounded_view_tokens": unbounded_view_tok,
-                "bounded_view_tokens": bounded_view_tok,
             }
         )
 
@@ -739,6 +802,25 @@ def calculate_cohort_summary(conv_list):
     py_c_count = 0
     bash_syntax_count = 0
 
+    py_c_multiline_total = sum(
+        1 for c in conv_list for cmd in c["commands"] if cmd.get("is_multiline_inline")
+    )
+    py_c_multiline_failed = sum(
+        1
+        for c in conv_list
+        for cmd in c["commands"]
+        if cmd.get("is_multiline_inline") and cmd["is_failed"]
+    )
+    py_c_oneline_total = sum(
+        1 for c in conv_list for cmd in c["commands"] if cmd.get("is_oneline_inline")
+    )
+    py_c_oneline_failed = sum(
+        1
+        for c in conv_list
+        for cmd in c["commands"]
+        if cmd.get("is_oneline_inline") and cmd["is_failed"]
+    )
+
     for c in conv_list:
         for cmd_entry in c["commands"]:
             cmd = cmd_entry["command"]
@@ -765,16 +847,37 @@ def calculate_cohort_summary(conv_list):
 
     total_prompt_tok = sum(c["prompt_tokens"] for c in conv_list)
     total_resp_tok = sum(c["resp_tokens"] for c in conv_list)
+    total_prose_tok = sum(c.get("prose_tokens", 0) for c in conv_list)
+    total_tool_args_tok = sum(c.get("tool_args_tokens", 0) for c in conv_list)
     total_think_tok = sum(c["thinking_tokens"] for c in conv_list)
     total_tool_tok = sum(c["tool_tokens"] for c in conv_list)
+    total_run_cmd_tok = sum(c.get("run_cmd_tokens", 0) for c in conv_list)
+    total_other_tool_tok = sum(c.get("other_tool_tokens", 0) for c in conv_list)
     total_system_tok = sum(c.get("system_tokens", 0) for c in conv_list)
     total_tokens = sum(c["total_tokens"] for c in conv_list)
+
+    total_api_input_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
+    total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
+    total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
 
     total_views = sum(c["file_views"] for c in conv_list)
     total_unbounded = sum(c["unbounded_views"] for c in conv_list)
     unbounded_pct = (total_unbounded / total_views * 100) if total_views > 0 else 0.0
     unbounded_view_tok = sum(c.get("unbounded_view_tokens", 0) for c in conv_list)
     bounded_view_tok = sum(c.get("bounded_view_tokens", 0) for c in conv_list)
+
+    ephemeral_skills_tok = sum(
+        c.get("ephemeral_breakdown", {}).get("skills_notice", 0) for c in conv_list
+    )
+    ephemeral_memory_tok = sum(
+        c.get("ephemeral_breakdown", {}).get("memory_recall", 0) for c in conv_list
+    )
+    ephemeral_sys_tok = sum(
+        c.get("ephemeral_breakdown", {}).get("system_message", 0) for c in conv_list
+    )
+    ephemeral_other_tok = sum(
+        c.get("ephemeral_breakdown", {}).get("other_ephemeral", 0) for c in conv_list
+    )
 
     conv_tokens = [c["total_tokens"] for c in conv_list]
     median_tokens = round(quantile(conv_tokens, 0.5))
@@ -822,6 +925,20 @@ def calculate_cohort_summary(conv_list):
         "friction_per_100_cmds": friction_per_100_cmds,
         "py_c_inline": py_c_count,
         "inline_per_100_cmds": inline_per_100_cmds,
+        "py_c_multiline": {
+            "total": py_c_multiline_total,
+            "failed": py_c_multiline_failed,
+            "fail_pct": round((py_c_multiline_failed / py_c_multiline_total * 100), 2)
+            if py_c_multiline_total > 0
+            else 0.0,
+        },
+        "py_c_oneline": {
+            "total": py_c_oneline_total,
+            "failed": py_c_oneline_failed,
+            "fail_pct": round((py_c_oneline_failed / py_c_oneline_total * 100), 2)
+            if py_c_oneline_total > 0
+            else 0.0,
+        },
         "bash_syntax": bash_syntax_count,
         "file_views": total_views,
         "unbounded_views": total_unbounded,
@@ -831,9 +948,40 @@ def calculate_cohort_summary(conv_list):
         "total_tokens": total_tokens,
         "prompt_tokens": total_prompt_tok,
         "response_tokens": total_resp_tok,
-        "thinking_tokens": total_think_tok,
+        "response_breakdown": {
+            "visible_prose_tokens": total_prose_tok,
+            "tool_call_args_tokens": total_tool_args_tok,
+            "thinking_tokens": total_think_tok,
+        },
         "tool_tokens": total_tool_tok,
+        "tool_breakdown": {
+            "unbounded_view_tokens": unbounded_view_tok,
+            "bounded_view_tokens": bounded_view_tok,
+            "run_command_tokens": total_run_cmd_tok,
+            "other_tool_tokens": total_other_tool_tok,
+        },
         "system_tokens": total_system_tok,
+        "system_breakdown": {
+            "skills_notice_tokens": ephemeral_skills_tok,
+            "memory_recall_tokens": ephemeral_memory_tok,
+            "system_message_tokens": ephemeral_sys_tok,
+            "other_ephemeral_tokens": ephemeral_other_tok,
+        },
+        "api_tokens_ground_truth": {
+            "input_tokens_fresh": total_api_input_tok,
+            "cache_read_tokens": total_api_cache_read_tok,
+            "output_tokens_model": total_api_output_tok,
+            "cache_hit_rate_pct": round(
+                (
+                    total_api_cache_read_tok
+                    / (total_api_input_tok + total_api_cache_read_tok)
+                    * 100
+                ),
+                2,
+            )
+            if (total_api_input_tok + total_api_cache_read_tok) > 0
+            else 0.0,
+        },
         "tokens_per_conv": tokens_per_conv,
         "median_tokens_per_conv": median_tokens,
         "p75_tokens_per_conv": p75_tokens,
@@ -850,12 +998,15 @@ def calculate_cohort_summary(conv_list):
 def format_delta(
     current, baseline, lower_is_better=True, is_pct=False, custom_tag=None
 ):
+    unit = "%" if is_pct else ""
     if baseline == 0:
-        return f"{current}"
+        if current == 0:
+            return f"0{unit} (FLAT)"
+        sign = "+" if current > 0 else ""
+        return f"{sign}{current:.2f}{unit} (NEW)"
     diff = current - baseline
     pct_change = (diff / baseline) * 100.0
     sign = "+" if diff > 0 else ""
-    unit = "%" if is_pct else ""
 
     if custom_tag:
         tag = custom_tag
@@ -949,6 +1100,7 @@ def run_audit(
     target_repo=None,
     exclude_repo=None,
     compare_mode=False,
+    print_summary=False,
 ):
     base_dir = locate_antigravity_dir()
     brain_dirs = locate_brain_directories(base_dir)
@@ -1110,6 +1262,32 @@ def run_audit(
             is_pct=True,
             val_suffix="%",
         )
+        print_row(
+            "Multiline py -c Fail Rate (%)",
+            baseline_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
+            target_summary.get("py_c_multiline", {}).get("fail_pct", 0.0),
+            lower_is_better=True,
+            is_pct=True,
+            val_suffix="%",
+        )
+        if (
+            target_summary.get("api_tokens_ground_truth", {}).get(
+                "cache_hit_rate_pct", 0
+            )
+            > 0
+        ):
+            print_row(
+                "Prompt Cache Hit Rate (%)",
+                baseline_summary.get("api_tokens_ground_truth", {}).get(
+                    "cache_hit_rate_pct", 0.0
+                ),
+                target_summary.get("api_tokens_ground_truth", {}).get(
+                    "cache_hit_rate_pct", 0.0
+                ),
+                lower_is_better=False,
+                is_pct=True,
+                val_suffix="%",
+            )
         print("-" * 78)
         print_row(
             "Median Tokens / Conversation",
@@ -1193,6 +1371,9 @@ def run_audit(
         json.dump(summary_payload, f, indent=2)
 
     print(f"\nAudit complete. Structured summary written to: {out_file}")
+    if print_summary:
+        print("\n=== STRUCTURED SUMMARY JSON ===")
+        print(json.dumps(summary_payload, indent=2))
     return out_file
 
 
@@ -1239,6 +1420,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Compare target window against baseline history and compute efficiency gains",
     )
+    parser.add_argument(
+        "--print-summary",
+        action="store_true",
+        help="Print structured JSON summary to stdout after audit completion",
+    )
     args = parser.parse_args()
 
     if args.inventory_only:
@@ -1252,4 +1438,5 @@ if __name__ == "__main__":
             target_repo=args.repo,
             exclude_repo=args.exclude,
             compare_mode=args.compare,
+            print_summary=args.print_summary,
         )

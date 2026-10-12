@@ -23,9 +23,13 @@ When the user wants to inspect recent performance or verify if previous remediat
 **Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
 
 **Critical Analytical Discipline (Anti-Hallucination Gate):**
-- **Verify Attribution & Magnitude Before Diagnosing:** Never attribute high tool token consumption to a single tool (such as `view_file`) without verifying the actual token contribution (`unbounded_view_tokens`, `bounded_view_tokens`, `system_tokens`) in `trajectory_audit_summary.json`. System streaming overhead (`EPHEMERAL_MESSAGE`) must not be confused with tool execution cost.
+- **Log File Selection (`transcript_full.jsonl` vs `transcript.jsonl`):** Trajectory auditing must prefer `transcript_full.jsonl` whenever present. Compact `transcript.jsonl` truncates tool outputs (`"truncated_fields": ["content"]`), causing tool token calculations (such as file views and command outputs) to report misleadingly tiny sizes (~20 chars/call) and producing false-positive efficiency claims.
+- **Decompose Model Response:** Response output tokens must distinguish between visible assistant prose, tool call arguments (e.g. `write_to_file` payloads), and internal reasoning/thinking tokens. A high response volume typically reflects active code generation and large edit payloads, not conversational loquacity.
+- **Verify Attribution & Magnitude Before Diagnosing:** Never attribute high tool token consumption to a single tool (such as `view_file`) without verifying the actual token contribution (`unbounded_view_tokens`, `bounded_view_tokens`, `run_command_tokens`, `system_tokens`) in `trajectory_audit_summary.json`. System streaming overhead (`EPHEMERAL_MESSAGE`) enters model context on every turn but must not be confused with tool execution cost.
+- **Distinguish Prompt Cache Read from Fresh Input:** When native API token metrics (`input_tokens`, `cache_read_tokens`) are present, report the Prompt Cache Hit Rate (~93%+). The agent processes tens of millions of context tokens via KV cache without incurring fresh input pricing.
 - **Normalize by Volume:** Compare rates (e.g. `Friction Loops / 100 Cmds`, `Inline Scripts / 100 Cmds`) rather than raw counts. An increase in raw incidents alongside an increase in total command volume is volume expansion, not quality drift.
 - **Beware of the Denominator Artifact:** A reduction in tokens/turn is only an efficiency gain if median or mean tokens per conversation also decreased. If user turns doubled, tokens/turn drops purely as a mathematical artifact of task granularity.
+- **Granular Inline Script Analysis:** Differentiate multi-line inline scripts (`py -c`, `node -e` with line breaks or >100 chars) from clean one-liners. Multi-line quoting collapses primarily in complex shell parsers, whereas one-liners have distinct failure patterns.
 - **Distinguish Intentional Non-Zero Exits:** TDD red-phase test assertions (`pytest` failing before writing code) and polling status (`gh pr checks` exit 8 pending) are normal workflow signals, not execution failures.
 
 ### Mode B: Deep Friction Audit & Tri-Layer Remediation
@@ -127,10 +131,59 @@ python3 "$SkillScripts/audit_trajectories.py" "$(pwd)" --since <YYYY-MM-DD> --re
 - `--all`: Parse all discovered sessions without conversation count limits.
 - `--limit <N>`: Maximum recent conversations to evaluate (default: 100).
 - `--inventory-only`: Rapid repository inventory scan without parsing transcripts (<2 seconds).
+- `--print-summary`: Print structured JSON summary payload directly to stdout after audit completion for programmatic piping without intermediate disk inspection.
 
 The diagnostic run produces two artifacts in the working directory:
 - `host_environment_probe.json`: Live binary inventory, stdout encoding status, and rule discrepancies.
 - `trajectory_audit_summary.json`: Command failure counts, token burn estimations, repository distribution, and extracted incident chains.
+
+#### Structure & Schema of `trajectory_audit_summary.json`
+
+When `--compare` is active, the JSON root provides:
+- `comparison.target_window`: Cohort metrics post `--since` date.
+- `comparison.baseline_window` (and alias `comparison.baseline`): Cohort metrics prior to `--since` date.
+
+Each cohort summary object provides:
+- `conversations`: Total active conversations in the window.
+- `user_turns`: Total user prompts.
+- `turns_per_conv`: Mean turns per conversation.
+- `commands`: Total CLI commands executed.
+- `cmds_per_turn`: Commands normalized per turn.
+- `failures`: Non-benign command failure count.
+- `failure_rate_pct`: True command failure percentage.
+- `friction_per_100_cmds`: High-friction incident rate per 100 commands.
+- `inline_per_100_cmds`: Inline `py -c` / `node -e` rate per 100 commands.
+- `py_c_multiline`: `{ "total": N, "failed": N, "fail_pct": Float }` (multi-line scripts with `\n` or >100 chars).
+- `py_c_oneline`: `{ "total": N, "failed": N, "fail_pct": Float }` (clean one-line scripts).
+- `unbounded_views`: Total unbounded `view_file` calls.
+- `unbounded_view_pct`: Percentage of file views that were unbounded.
+- `total_tokens`: Total tokens across all categories.
+- `prompt_tokens`: Tokens from user prompts.
+- `response_tokens`: Total response tokens generated by the model (`visible_prose_tokens` + `tool_call_args_tokens`).
+- `response_breakdown`:
+  - `visible_prose_tokens`: Assistant markdown prose.
+  - `tool_call_args_tokens`: Tool call arguments (file write payloads, edits, commands).
+  - `thinking_tokens`: Model chain-of-thought tokens.
+- `tool_tokens`: Total tool output tokens returned to the model.
+- `tool_breakdown`:
+  - `unbounded_view_tokens`: File view outputs without start/end lines.
+  - `bounded_view_tokens`: File view outputs with line slicing.
+  - `run_command_tokens`: Command stdout/stderr outputs.
+  - `other_tool_tokens`: Outputs from specialized tools (MCP, subagents, etc.).
+- `system_tokens`: Total system / ephemeral injected tokens.
+- `system_breakdown`:
+  - `skills_notice_tokens`: `[ACTIVE SKILLS LOADED: ...]` injections.
+  - `memory_recall_tokens`: `[MCP MEMORY RECALL: ...]` injections.
+  - `system_message_tokens`: `<SYSTEM_MESSAGE>` injections.
+  - `other_ephemeral_tokens`: Other runtime notifications.
+- `api_tokens_ground_truth`:
+  - `input_tokens_fresh`: Uncached input tokens.
+  - `cache_read_tokens`: Prompt cache read tokens.
+  - `output_tokens_model`: Model output tokens.
+  - `cache_hit_rate_pct`: Context cache hit ratio (`cache_read / (input + cache_read) * 100`).
+- `tokens_per_conv`, `median_tokens_per_conv`, `p90_tokens_per_conv`: Per-session token distribution.
+- `tokens_per_turn`: Ratio of total tokens to user turns (task granularity indicator).
+- `high_friction_incidents`: Detailed list of multi-step retry chains.
 
 ### Phase 2: Review Diagnostic Outputs
 
