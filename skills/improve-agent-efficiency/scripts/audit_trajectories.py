@@ -1720,69 +1720,141 @@ def run_audit(
             t_str = f"{tgt_val}{val_suffix}" if tgt_val is not None else "N/A"
             print(header_fmt.format(label, b_str, t_str, delta_str))
 
+        def pooled_ratio_stat(pairs):
+            tot_num = sum(p[0] for p in pairs)
+            tot_den = sum(p[1] for p in pairs)
+            return (tot_num / tot_den * 100.0) if tot_den > 0 else 0.0
+
         # Conversation-level arrays for non-parametric bootstrap testing
-        t_fail_rates = [
-            sum(1 for cmd in c["commands"] if cmd["is_failed"]) / len(c["commands"])
-            if len(c["commands"]) > 0
-            else 0.0
+        t_fail_pairs = [
+            (
+                sum(1 for cmd in c["commands"] if cmd["is_failed"]),
+                len(c["commands"]),
+            )
             for c in target_convs
         ]
-        b_fail_rates = [
-            sum(1 for cmd in c["commands"] if cmd["is_failed"]) / len(c["commands"])
-            if len(c["commands"]) > 0
-            else 0.0
+        b_fail_pairs = [
+            (
+                sum(1 for cmd in c["commands"] if cmd["is_failed"]),
+                len(c["commands"]),
+            )
             for c in baseline_convs
         ]
 
-        t_frictions = [
-            len(
-                [
-                    inc
-                    for inc in c["incident_chains"]
-                    if inc["retry_count"] >= 1 or not inc["resolved"]
-                ]
+        t_friction_pairs = [
+            (
+                len(
+                    [
+                        inc
+                        for inc in c["incident_chains"]
+                        if inc["retry_count"] >= 1 or not inc["resolved"]
+                    ]
+                ),
+                len(c["commands"]),
             )
-            / len(c["commands"])
-            * 100
-            if len(c["commands"]) > 0
-            else 0.0
             for c in target_convs
         ]
-        b_frictions = [
-            len(
-                [
-                    inc
-                    for inc in c["incident_chains"]
-                    if inc["retry_count"] >= 1 or not inc["resolved"]
-                ]
+        b_friction_pairs = [
+            (
+                len(
+                    [
+                        inc
+                        for inc in c["incident_chains"]
+                        if inc["retry_count"] >= 1 or not inc["resolved"]
+                    ]
+                ),
+                len(c["commands"]),
             )
-            / len(c["commands"])
-            * 100
-            if len(c["commands"]) > 0
-            else 0.0
             for c in baseline_convs
         ]
 
         t_tokens = [c["total_tokens"] for c in target_convs]
         b_tokens = [c["total_tokens"] for c in baseline_convs]
 
-        t_unmod_overlaps = [
-            c.get("unmodified_overlap_ratio_pct", 0.0) for c in target_convs
+        t_unmod_overlap_pairs = [
+            (
+                c.get("unmodified_overlap_lines", 0),
+                c.get("unmodified_view_lines", 0),
+            )
+            for c in target_convs
         ]
-        b_unmod_overlaps = [
-            c.get("unmodified_overlap_ratio_pct", 0.0) for c in baseline_convs
+        b_unmod_overlap_pairs = [
+            (
+                c.get("unmodified_overlap_lines", 0),
+                c.get("unmodified_view_lines", 0),
+            )
+            for c in baseline_convs
+        ]
+
+        t_unbounded_pairs = [
+            (
+                c.get("unbounded_views", 0),
+                c.get("file_views", 0),
+            )
+            for c in target_convs
+        ]
+        b_unbounded_pairs = [
+            (
+                c.get("unbounded_views", 0),
+                c.get("file_views", 0),
+            )
+            for c in baseline_convs
+        ]
+
+        t_api_convs = [c for c in target_convs if c.get("has_api_tokens")]
+        b_api_convs = [c for c in baseline_convs if c.get("has_api_tokens")]
+
+        t_cache_pairs = [
+            (
+                c.get("api_cache_read_tokens", 0) or 0,
+                (c.get("api_input_tokens", 0) or 0)
+                + (c.get("api_cache_read_tokens", 0) or 0),
+            )
+            for c in t_api_convs
+        ]
+        b_cache_pairs = [
+            (
+                c.get("api_cache_read_tokens", 0) or 0,
+                (c.get("api_input_tokens", 0) or 0)
+                + (c.get("api_cache_read_tokens", 0) or 0),
+            )
+            for c in b_api_convs
+        ]
+
+        t_api_totals = [
+            (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_read_tokens", 0) or 0)
+            + (c.get("api_output_tokens", 0) or 0)
+            for c in t_api_convs
+        ]
+        b_api_totals = [
+            (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_read_tokens", 0) or 0)
+            + (c.get("api_output_tokens", 0) or 0)
+            for c in b_api_convs
         ]
 
         # Conversation-level non-parametric bootstrap tests (1,000 resamples)
-        _, _, p_fail, sig_fail = bootstrap_conversation_diff(t_fail_rates, b_fail_rates)
+        _, _, p_fail, sig_fail = bootstrap_conversation_diff(
+            t_fail_pairs, b_fail_pairs, stat_fn=pooled_ratio_stat
+        )
         _, _, p_friction, sig_friction = bootstrap_conversation_diff(
-            t_frictions, b_frictions
+            t_friction_pairs, b_friction_pairs, stat_fn=pooled_ratio_stat
         )
         _, _, p_median_tok, sig_median_tok = bootstrap_conversation_diff(
             t_tokens, b_tokens, stat_fn=lambda arr: quantile(arr, 0.5)
         )
         _, _, p_unmod_overlap, sig_unmod_overlap = bootstrap_conversation_diff(
-            t_unmod_overlaps, b_unmod_overlaps
+            t_unmod_overlap_pairs, b_unmod_overlap_pairs, stat_fn=pooled_ratio_stat
+        )
+        _, _, p_unbounded, sig_unbounded = bootstrap_conversation_diff(
+            t_unbounded_pairs, b_unbounded_pairs, stat_fn=pooled_ratio_stat
+        )
+        _, _, p_cache, sig_cache = bootstrap_conversation_diff(
+            t_cache_pairs, b_cache_pairs, stat_fn=pooled_ratio_stat
+        )
+        _, _, p_api_conv, sig_api_conv = bootstrap_conversation_diff(
+            t_api_totals, b_api_totals
         )
 
         print_row(
@@ -1854,13 +1926,6 @@ def run_audit(
             val_suffix="%",
             custom_tag="NEUTRAL",
         )
-        sig_unbounded = is_statistically_significant(
-            target_summary["unbounded_views"],
-            target_summary["file_views"],
-            baseline_summary["unbounded_views"],
-            baseline_summary["file_views"],
-            min_samples=30,
-        )
         print_row(
             "Unbounded File Views (%)",
             baseline_summary["unbounded_view_pct"],
@@ -1898,25 +1963,6 @@ def run_audit(
         tgt_api = target_summary.get("api_tokens_ground_truth", {})
         b_cache = base_api.get("cache_hit_rate_pct")
         t_cache = tgt_api.get("cache_hit_rate_pct")
-        tgt_cache_tot = (tgt_api.get("input_tokens_fresh") or 0) + (
-            tgt_api.get("cache_read_tokens") or 0
-        )
-        base_cache_tot = (base_api.get("input_tokens_fresh") or 0) + (
-            base_api.get("cache_read_tokens") or 0
-        )
-        sig_cache = is_statistically_significant(
-            tgt_api.get("cache_read_tokens"),
-            tgt_cache_tot,
-            base_api.get("cache_read_tokens"),
-            base_cache_tot,
-            min_samples=30,
-        )
-        sig_api_conv = (
-            len(target_convs) >= 30
-            and len(baseline_convs) >= 30
-            and bool(tgt_api.get("has_ground_truth"))
-            and bool(base_api.get("has_ground_truth"))
-        )
         print_row(
             "Prompt Cache Hit Rate (%)",
             b_cache,
@@ -1999,6 +2045,18 @@ def run_audit(
                     "unmodified_overlap": {
                         "p_value": round(p_unmod_overlap, 4),
                         "significant": sig_unmod_overlap,
+                    },
+                    "unbounded_views": {
+                        "p_value": round(p_unbounded, 4),
+                        "significant": sig_unbounded,
+                    },
+                    "prompt_cache_hit": {
+                        "p_value": round(p_cache, 4),
+                        "significant": sig_cache,
+                    },
+                    "api_context": {
+                        "p_value": round(p_api_conv, 4),
+                        "significant": sig_api_conv,
                     },
                 },
             },
