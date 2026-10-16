@@ -264,10 +264,83 @@ class TestAuditTrajectories(unittest.TestCase):
             tmp_home = Path(tmp)
             direct_repo = tmp_home / "my-home-repo"
             (direct_repo / ".git").mkdir(parents=True)
-            with mock.patch.object(Path, "home", return_value=tmp_home):
+            with (
+                mock.patch.object(Path, "home", return_value=tmp_home),
+                mock.patch("os.getcwd", return_value=str(tmp_home)),
+            ):
                 repos = audit_trajectories.discover_git_repositories([], tmp_home)
                 repo_names = [Path(p).name for p in repos.values()]
                 self.assertIn("my-home-repo", repo_names)
+
+    def test_mixed_case_active_workspace_is_extracted(self):
+        """parse_conversations should extract workspace paths from mixed-case 'Active Workspace is' lines."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_dir = tmp_path / "MixedCaseRepo"
+            (repo_dir / ".git").mkdir(parents=True)
+
+            brain_dir = tmp_path / "brain"
+            c_dir = brain_dir / "conv-mixed" / ".system_generated" / "logs"
+            c_dir.mkdir(parents=True)
+            step = {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": "2026-04-01T10:00:00Z",
+                "content": f"<user_information>\nThe USER's Active Workspace is {repo_dir}.\n</user_information>",
+            }
+            (c_dir / "transcript.jsonl").write_text(
+                json.dumps(step) + "\n", encoding="utf-8"
+            )
+
+            norm_repo = audit_trajectories.norm_path(str(repo_dir))
+            candidate_repos = {norm_repo: str(repo_dir)}
+
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir], candidate_repos, max_conversations=10
+            )
+            self.assertEqual(len(convs), 1)
+            self.assertEqual(convs[0]["repo_path"], str(repo_dir))
+
+    def test_compare_mode_caps_each_cohort_at_max_conversations(self):
+        """In compare_mode, parse_conversations should cap target and baseline cohorts separately at max_conversations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain_dir = tmp_path / "brain"
+
+            # Create 3 target sessions (>= 2026-04-10) and 3 baseline sessions (< 2026-04-10)
+            sessions = [
+                ("target-1", "2026-04-12T10:00:00Z"),
+                ("target-2", "2026-04-11T10:00:00Z"),
+                ("target-3", "2026-04-10T12:00:00Z"),
+                ("base-1", "2026-04-09T10:00:00Z"),
+                ("base-2", "2026-04-08T10:00:00Z"),
+                ("base-3", "2026-04-07T10:00:00Z"),
+            ]
+            for cid, ts in sessions:
+                c_dir = brain_dir / cid / ".system_generated" / "logs"
+                c_dir.mkdir(parents=True)
+                step = {
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": ts,
+                    "content": "hello",
+                }
+                (c_dir / "transcript.jsonl").write_text(
+                    json.dumps(step) + "\n", encoding="utf-8"
+                )
+
+            since_dt = datetime(2026, 4, 10)
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir],
+                {},
+                max_conversations=2,
+                since_dt=since_dt,
+                compare_mode=True,
+            )
+            target_parsed = [c for c in convs if c["dt"] >= since_dt]
+            base_parsed = [c for c in convs if c["dt"] < since_dt]
+            self.assertEqual(len(target_parsed), 2)
+            self.assertEqual(len(base_parsed), 2)
 
 
 class TestProbeEnvironment(unittest.TestCase):
@@ -299,6 +372,29 @@ class TestProbeEnvironment(unittest.TestCase):
                 types = [d["type"] for d in res["discrepancies"]]
                 self.assertIn("rule_file_over_24kb_cap", types)
 
+    def test_probe_discovers_root_gemini_and_rules_without_config_gemini(self):
+        """probe_global_configuration_discrepancies should audit ~/.gemini/GEMINI.md and rules/*.md even if ~/.gemini/config/GEMINI.md is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            gemini_dir = tmp_home / ".gemini"
+            rules_dir = gemini_dir / "config" / "rules"
+            rules_dir.mkdir(parents=True)
+            (gemini_dir / "GEMINI.md").write_text("a" * 400, encoding="utf-8")
+            (rules_dir / "custom.md").write_text("b" * 400, encoding="utf-8")
+
+            with mock.patch.object(Path, "home", return_value=tmp_home):
+                res = probe_environment.probe_global_configuration_discrepancies({})
+                self.assertTrue(res["config_found"])
+                self.assertEqual(res["total_rule_bytes"], 800)
+
+    def test_run_probe_creates_missing_output_dir(self):
+        """run_probe should create missing parent directories for output_dir."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nested_out = Path(tmp) / "nested" / "dir" / "out"
+            with mock.patch("sys.stdout", io.StringIO()):
+                probe_environment.run_probe(str(nested_out))
+            self.assertTrue((nested_out / "host_environment_probe.json").exists())
+
 
 class TestRepoSafetyAndPackaging(unittest.TestCase):
     def test_plugin_and_skills_json_exist_and_valid(self):
@@ -315,7 +411,7 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
         self.assertIn("entries", sdata)
 
     def test_check_manifest_integrity_validates_skills_frontmatter(self):
-        """check_manifest_integrity should detect missing frontmatter in SKILL.md."""
+        """check_manifest_integrity should detect missing or invalid YAML frontmatter and plugin.json names."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_repo = Path(tmp)
             bad_skill = tmp_repo / "skills" / "bad-skill"
@@ -324,6 +420,30 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
 
             violations = check_repo_safety.check_manifest_integrity(tmp_repo)
             self.assertTrue(any("SKILL.md" in v for v in violations))
+
+            # Invalid YAML syntax or non-string fields should be rejected
+            (bad_skill / "SKILL.md").write_text(
+                "---\nname: [1, 2]\ndescription: true\n---\n# Bad Types\n",
+                encoding="utf-8",
+            )
+            violations2 = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertTrue(any("Frontmatter 'name'" in v for v in violations2))
+            self.assertTrue(any("Frontmatter 'description'" in v for v in violations2))
+
+            # Valid block scalar frontmatter should pass
+            (bad_skill / "SKILL.md").write_text(
+                "---\nname: bad-skill\ndescription: >-\n  Multi-line valid description.\n---\n# Valid\n",
+                encoding="utf-8",
+            )
+            violations3 = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertEqual(violations3, [])
+
+            # Invalid plugin.json name characters should be rejected
+            (tmp_repo / "plugin.json").write_text(
+                json.dumps({"name": "invalid name with spaces!"}), encoding="utf-8"
+            )
+            violations4 = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertTrue(any("plugin.json" in v for v in violations4))
 
 
 if __name__ == "__main__":

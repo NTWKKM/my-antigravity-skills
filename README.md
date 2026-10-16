@@ -28,7 +28,7 @@ The skill bundles two standalone, zero-dependency Python scripts in `scripts/` a
 1. **Host Environment & Rule Budget Probe ([`scripts/probe_environment.py`](./skills/improve-agent-efficiency/scripts/probe_environment.py)):**
    - Tests UTF-8 codec resilience in-memory without polluting `stdout`.
    - Inspects host availability and version strings for standard engineering & Antigravity CLI binaries (`git`, `gh`, `rg`, `fd`, `jq`, `curl`, `python`, `python3`, `uv`, `node`, `pnpm`, `npm`, `cargo`, `go`, `dotnet`, `agy`, plus platform package managers `brew`, `winget`, `pwsh`, `apt`).
-   - Audits `~/.gemini/config/GEMINI.md`, `AGENTS.md`, and `rules/*.md` against Antigravity's **`24,000`-byte per-file truncation cap** and **`20,000`-token `defaultRulesBudget`**, as well as binary discrepancies and `hooks.json` presence.
+   - Audits `~/.gemini/GEMINI.md`, `~/.gemini/AGENTS.md`, `~/.gemini/config/GEMINI.md`, `~/.gemini/config/AGENTS.md`, and `~/.gemini/config/rules/*.md` against Antigravity's **`24,000`-byte per-file truncation cap** and **`20,000`-token `defaultRulesBudget`**, as well as binary discrepancies and `hooks.json` presence.
    - Writes diagnostic output to `host_environment_probe.json`.
 
 2. **Causal Trajectory Auditor ([`scripts/audit_trajectories.py`](./skills/improve-agent-efficiency/scripts/audit_trajectories.py)):**

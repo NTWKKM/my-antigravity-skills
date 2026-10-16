@@ -537,15 +537,23 @@ def parse_conversations(
 
     conv_candidates.sort(key=lambda x: x[0], reverse=True)
     total_candidates = len(conv_candidates)
+    target_count = 0
+    baseline_count = 0
 
     for mtime, item, tpath, conv_dt in conv_candidates:
-        if (
-            not compare_mode
-            and max_conversations
-            and max_conversations > 0
-            and len(conversations) >= max_conversations
-        ):
-            break
+        if max_conversations and max_conversations > 0:
+            if compare_mode and since_dt:
+                if (
+                    target_count >= max_conversations
+                    and baseline_count >= max_conversations
+                ):
+                    break
+                if conv_dt >= since_dt and target_count >= max_conversations:
+                    continue
+                if conv_dt < since_dt and baseline_count >= max_conversations:
+                    continue
+            elif len(conversations) >= max_conversations:
+                break
         first_prompt = ""
         user_prompts = []
         active_ws = ""
@@ -653,10 +661,10 @@ def parse_conversations(
                 for line in content.split("\n"):
                     s_line = line.strip()
                     low_line = s_line.lower()
-                    if "active workspace is" in low_line:
-                        cand = (
-                            s_line.split("active workspace is")[-1].strip().rstrip(".")
-                        )
+                    ws_marker = "active workspace is"
+                    ws_idx = low_line.find(ws_marker)
+                    if ws_idx != -1:
+                        cand = s_line[ws_idx + len(ws_marker) :].strip().rstrip(".")
                         if cand:
                             active_ws = norm_path(cand)
                     elif low_line.startswith("active workspaces:"):
@@ -1083,6 +1091,11 @@ def parse_conversations(
                 "bounded_views": file_views_bounded,
             }
         )
+        if compare_mode and since_dt:
+            if conv_dt >= since_dt:
+                target_count += 1
+            else:
+                baseline_count += 1
 
     return conversations, total_candidates
 

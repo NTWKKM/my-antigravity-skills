@@ -128,23 +128,45 @@ AGGREGATE_RULES_TOKEN_BUDGET = 20000
 def probe_global_configuration_discrepancies(binaries):
     """Cross-references active GEMINI.md / AGENTS.md rules against detected binaries and Antigravity size budgets."""
     discrepancies = []
-    config_root = Path.home() / ".gemini" / "config"
+    gemini_home = Path.home() / ".gemini"
+    config_root = gemini_home / "config"
+    root_gemini_path = gemini_home / "GEMINI.md"
+    root_agents_path = gemini_home / "AGENTS.md"
     gemini_config_path = config_root / "GEMINI.md"
     agents_config_path = config_root / "AGENTS.md"
     hooks_config_path = config_root / "hooks.json"
 
     rule_files = []
-    for candidate in (gemini_config_path, agents_config_path):
+    seen_paths = set()
+    for candidate in (
+        root_gemini_path,
+        root_agents_path,
+        gemini_config_path,
+        agents_config_path,
+    ):
         if candidate.exists():
-            rule_files.append(candidate)
+            resolved = str(candidate.resolve())
+            if resolved not in seen_paths:
+                seen_paths.add(resolved)
+                rule_files.append(candidate)
     rules_dir = config_root / "rules"
     if rules_dir.exists() and rules_dir.is_dir():
-        rule_files.extend(sorted(rules_dir.glob("*.md")))
+        for rf_cand in sorted(rules_dir.glob("*.md")):
+            resolved = str(rf_cand.resolve())
+            if resolved not in seen_paths:
+                seen_paths.add(resolved)
+                rule_files.append(rf_cand)
 
-    if not gemini_config_path.exists() and not agents_config_path.exists():
+    primary_config_path = (
+        gemini_config_path
+        if gemini_config_path.exists()
+        else (root_gemini_path if root_gemini_path.exists() else gemini_config_path)
+    )
+
+    if not rule_files:
         return {
             "config_found": False,
-            "config_path": str(gemini_config_path),
+            "config_path": str(primary_config_path),
             "hooks_configured": hooks_config_path.exists(),
             "discrepancies": discrepancies,
         }
@@ -214,7 +236,7 @@ def probe_global_configuration_discrepancies(binaries):
 
     return {
         "config_found": True,
-        "config_path": str(gemini_config_path),
+        "config_path": str(primary_config_path),
         "hooks_configured": hooks_config_path.exists(),
         "total_rule_bytes": total_rule_bytes,
         "estimated_rule_tokens": est_rule_tokens,
@@ -243,6 +265,7 @@ def run_probe(output_dir=None):
     }
 
     out_path = Path(output_dir) if output_dir else Path.cwd()
+    out_path.mkdir(parents=True, exist_ok=True)
     target_file = out_path / "host_environment_probe.json"
     with open(target_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
