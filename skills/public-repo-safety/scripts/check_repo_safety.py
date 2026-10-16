@@ -372,8 +372,30 @@ def parse_yaml_frontmatter(fm_text: str) -> dict:
         yaml = None
 
     if yaml is not None:
+
+        class _UniqueKeySafeLoader(yaml.SafeLoader):
+            pass
+
+        def _construct_mapping(loader, node, deep=False):
+            seen_keys = set()
+            for key_node, _ in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in seen_keys:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate YAML key ({key})",
+                        key_node.start_mark,
+                    )
+                seen_keys.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+        _UniqueKeySafeLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            _construct_mapping,
+        )
         try:
-            loaded = yaml.safe_load(fm_text)
+            loaded = yaml.load(fm_text, Loader=_UniqueKeySafeLoader)  # nosec B506
         except yaml.YAMLError as yex:
             raise ValueError(f"YAML parse error: {yex}") from yex
         if not isinstance(loaded, dict):

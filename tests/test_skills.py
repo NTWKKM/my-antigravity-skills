@@ -456,6 +456,16 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
                 any("Invalid YAML frontmatter" in v for v in violations_esc)
             )
 
+            # Duplicate YAML keys should be rejected
+            (bad_skill / "SKILL.md").write_text(
+                "---\nname: bad-skill\nname: bad-skill\ndescription: duplicate key\n---\n# Duplicate\n",
+                encoding="utf-8",
+            )
+            violations_dup = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertTrue(
+                any("Invalid YAML frontmatter" in v for v in violations_dup)
+            )
+
             # Valid block scalar frontmatter should pass
             (bad_skill / "SKILL.md").write_text(
                 "---\nname: bad-skill\ndescription: >-\n  Multi-line valid description.\n---\n# Valid\n",
