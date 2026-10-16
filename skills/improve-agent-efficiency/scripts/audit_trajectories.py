@@ -484,11 +484,11 @@ def parse_conversations(
             # Determine true conversation start time and prompt preview from user prompt
             start_dt = None
             first_step_text = ""
-            early_tokens = []
+            is_audit_session = False
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
                     for line_idx, line in enumerate(f):
-                        if line_idx > 15:
+                        if line_idx > 25:
                             break
                         line_str = line.strip()
                         if not line_str:
@@ -505,15 +505,44 @@ def parse_conversations(
                         st = d0.get("type", "")
                         source = d0.get("source", "")
                         c_text = d0.get("content", "") or ""
-                        if isinstance(c_text, str) and c_text:
-                            early_tokens.append(c_text)
+
+                        if (
+                            st == "USER_INPUT" or source == "USER_EXPLICIT"
+                        ) and not first_step_text:
+                            first_step_text = c_text if isinstance(c_text, str) else ""
+
+                        if auto_exclude_audit and not is_audit_session:
+                            # 1. Action evidence from user skill or audit request invocation
                             if (
                                 st == "USER_INPUT" or source == "USER_EXPLICIT"
-                            ) and not first_step_text:
-                                first_step_text = c_text
-                        for tc in d0.get("tool_calls", []) or []:
-                            early_tokens.append(tc.get("name") or "")
-                            early_tokens.append(str(tc.get("args") or ""))
+                            ) and isinstance(c_text, str):
+                                c_low = c_text.lower()
+                                if (
+                                    "/improve-agent-efficiency" in c_low
+                                    or '<skill>the user requested you read and use the "improve-agent-efficiency"'
+                                    in c_low
+                                    or "antigravity token usage analysis" in c_low
+                                ):
+                                    is_audit_session = True
+
+                            # 2. Action evidence from executed audit commands
+                            for tc in d0.get("tool_calls", []) or []:
+                                if tc.get("name") == "run_command":
+                                    cmd = (
+                                        tc.get("args", {}).get("CommandLine") or ""
+                                    ).lower()
+                                    if any(
+                                        s in cmd
+                                        for s in [
+                                            "audit_trajectories.py",
+                                            "probe_environment.py",
+                                            "analyze_token_landmarks.py",
+                                            "bootstrap_landmarks.py",
+                                            "detect_eras_and_landmarks.py",
+                                        ]
+                                    ):
+                                        is_audit_session = True
+                                        break
             except Exception:
                 pass
 
@@ -523,23 +552,9 @@ def parse_conversations(
                 except Exception:
                     continue
 
-            # Auto-exclude audit sessions (current active session or sessions executing trajectory audit)
-            if auto_exclude_audit:
-                early_haystack = " ".join(early_tokens).lower()
-                audit_keywords = [
-                    "audit_trajectories",
-                    "probe_environment",
-                    "/improve-agent-efficiency",
-                    "improve-agent-efficiency",
-                    "antigravity token usage analysis",
-                    "token usage analysis",
-                    "trajectory audit",
-                    "analyze_token_landmarks",
-                    "clean_cohort_session_ids",
-                    "trajectory_audit_summary",
-                ]
-                if any(k in early_haystack for k in audit_keywords):
-                    continue
+            # Auto-exclude audit sessions identified strictly by action evidence
+            if auto_exclude_audit and is_audit_session:
+                continue
 
             if until_dt and start_dt > until_dt:
                 continue
@@ -1939,16 +1954,14 @@ def run_audit(
             for c in b_api_convs
         ]
 
-        t_api_totals = [
+        t_api_context = [
             (c.get("api_input_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
-            + (c.get("api_output_tokens", 0) or 0)
             for c in t_api_convs
         ]
-        b_api_totals = [
+        b_api_context = [
             (c.get("api_input_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
-            + (c.get("api_output_tokens", 0) or 0)
             for c in b_api_convs
         ]
 
@@ -1974,8 +1987,8 @@ def run_audit(
         _, _, p_cache, sig_cache = bootstrap_conversation_diff(
             t_cache_pairs, b_cache_pairs, stat_fn=pooled_ratio_stat
         )
-        _, _, p_api_conv, sig_api_conv = bootstrap_conversation_diff(
-            t_api_totals, b_api_totals
+        _, _, p_api_context, sig_api_context = bootstrap_conversation_diff(
+            t_api_context, b_api_context
         )
         _, _, p_api_fresh, sig_api_fresh = bootstrap_conversation_diff(
             t_api_fresh, b_api_fresh
@@ -2101,7 +2114,7 @@ def run_audit(
             base_api.get("context_per_conv") or base_api.get("total_api_per_conv"),
             tgt_api.get("context_per_conv") or tgt_api.get("total_api_per_conv"),
             lower_is_better=True,
-            is_significant=sig_api_conv,
+            is_significant=sig_api_context,
         )
         print_row(
             "API Fresh Input / Conv",
@@ -2179,8 +2192,8 @@ def run_audit(
                         "significant": sig_cache,
                     },
                     "api_context": {
-                        "p_value": round(p_api_conv, 4),
-                        "significant": sig_api_conv,
+                        "p_value": round(p_api_context, 4),
+                        "significant": sig_api_context,
                     },
                     "api_input_tokens": {
                         "p_value": round(p_api_fresh, 4),

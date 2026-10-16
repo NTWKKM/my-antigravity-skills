@@ -342,6 +342,184 @@ class TestAuditTrajectories(unittest.TestCase):
             self.assertEqual(len(target_parsed), 2)
             self.assertEqual(len(base_parsed), 2)
 
+    def test_auto_exclude_audit_requires_action_evidence(self):
+        """auto_exclude_audit should only exclude sessions with executed audit commands or explicit skill triggers, not mere text mentions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain_dir = tmp_path / "brain"
+
+            # Session A: Mentions audit_trajectories.py in prompt and tool response (e.g. code review/view_file), but does not execute audit command
+            dir_a = brain_dir / "conv-mention-only" / ".system_generated" / "logs"
+            dir_a.mkdir(parents=True)
+            steps_a = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": "2026-04-12T10:00:00Z",
+                    "content": "Can you review scripts/audit_trajectories.py for me?",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-04-12T10:00:05Z",
+                    "content": "Sure, viewing audit_trajectories.py",
+                    "tool_calls": [
+                        {
+                            "name": "view_file",
+                            "args": {"AbsolutePath": "/path/to/audit_trajectories.py"},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "TOOL_RESPONSE",
+                    "content": "def run_audit():\n    trajectory_audit_summary = {}",
+                },
+            ]
+            (dir_a / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in steps_a) + "\n", encoding="utf-8"
+            )
+
+            # Session B: Executes audit_trajectories.py via run_command
+            dir_b = brain_dir / "conv-audit-action" / ".system_generated" / "logs"
+            dir_b.mkdir(parents=True)
+            steps_b = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": "2026-04-12T10:05:00Z",
+                    "content": "Please run the audit",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-04-12T10:05:05Z",
+                    "content": "Running trajectory audit...",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "python3 skills/improve-agent-efficiency/scripts/audit_trajectories.py"
+                            },
+                        }
+                    ],
+                },
+            ]
+            (dir_b / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in steps_b) + "\n", encoding="utf-8"
+            )
+
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir],
+                {},
+                max_conversations=10,
+                auto_exclude_audit=True,
+            )
+            # Session A is preserved (not an audit session); Session B is excluded
+            parsed_ids = [c["id"] for c in convs]
+            self.assertIn("conv-mention-only", parsed_ids)
+            self.assertNotIn("conv-audit-action", parsed_ids)
+
+    def test_comparative_bootstrap_api_context_excludes_model_output(self):
+        """In comparative mode, the api_context bootstrap test should resample fresh input + cache read, excluding output tokens."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain_dir = tmp_path / "brain"
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+
+            # Target session (2026-04-12)
+            dir_t = brain_dir / "conv-target" / ".system_generated" / "logs"
+            dir_t.mkdir(parents=True)
+            steps_t = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": "2026-04-12T10:00:00Z",
+                    "content": "Hello",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-04-12T10:00:05Z",
+                    "content": "Done",
+                    "input_tokens": 100,
+                    "cache_read_tokens": 200,
+                    "output_tokens": 50,
+                },
+            ]
+            (dir_t / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in steps_t) + "\n", encoding="utf-8"
+            )
+
+            # Baseline session (2026-04-08)
+            dir_b = brain_dir / "conv-baseline" / ".system_generated" / "logs"
+            dir_b.mkdir(parents=True)
+            steps_b = [
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": "2026-04-08T10:00:00Z",
+                    "content": "Hello",
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-04-12T10:00:05Z",
+                    "content": "Done",
+                    "input_tokens": 300,
+                    "cache_read_tokens": 400,
+                    "output_tokens": 70,
+                },
+            ]
+            (dir_b / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in steps_b) + "\n", encoding="utf-8"
+            )
+
+            captured_calls = []
+            orig_bootstrap = audit_trajectories.bootstrap_conversation_diff
+
+            def tracking_bootstrap(t_arr, b_arr, **kwargs):
+                captured_calls.append((t_arr, b_arr, kwargs.get("stat_fn")))
+                return orig_bootstrap(t_arr, b_arr, **kwargs)
+
+            with (
+                mock.patch.object(
+                    audit_trajectories,
+                    "locate_brain_directories",
+                    return_value=[brain_dir],
+                ),
+                mock.patch.object(
+                    audit_trajectories, "discover_git_repositories", return_value={}
+                ),
+                mock.patch.object(
+                    audit_trajectories,
+                    "bootstrap_conversation_diff",
+                    side_effect=tracking_bootstrap,
+                ),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                out_file = audit_trajectories.run_audit(
+                    output_dir=str(out_dir),
+                    since_date="2026-04-10",
+                    compare_mode=True,
+                )
+                payload = json.loads(Path(out_file).read_text(encoding="utf-8"))
+                boot_tests = payload["comparison"]["bootstrap_significance_tests"]
+                self.assertIn("api_context", boot_tests)
+
+                # Check captured bootstrap call for api_context:
+                # Should resample t_api_context = [100 + 200 = 300] and b_api_context = [300 + 400 = 700]
+                # NOT [350] or [770] which include model output
+                matching_calls = [
+                    (t, b) for t, b, fn in captured_calls if t == [300] and b == [700]
+                ]
+                self.assertEqual(len(matching_calls), 1)
+
 
 class TestProbeEnvironment(unittest.TestCase):
     def test_probe_python_environment_does_not_pollute_stdout(self):
