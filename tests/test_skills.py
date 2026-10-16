@@ -430,55 +430,56 @@ class TestAuditTrajectories(unittest.TestCase):
             out_dir = tmp_path / "out"
             out_dir.mkdir()
 
-            # Target session (2026-04-12)
-            dir_t = brain_dir / "conv-target" / ".system_generated" / "logs"
-            dir_t.mkdir(parents=True)
-            steps_t = [
-                {
-                    "step_index": 0,
-                    "type": "USER_INPUT",
-                    "source": "USER_EXPLICIT",
-                    "created_at": "2026-04-12T10:00:00Z",
-                    "content": "Hello",
-                },
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "created_at": "2026-04-12T10:00:05Z",
-                    "content": "Done",
-                    "input_tokens": 100,
-                    "cache_read_tokens": 200,
-                    "output_tokens": 50,
-                },
-            ]
-            (dir_t / "transcript.jsonl").write_text(
-                "\n".join(json.dumps(s) for s in steps_t) + "\n", encoding="utf-8"
-            )
+            # Create 15 target sessions (>= 2026-04-10) and 15 baseline sessions (< 2026-04-10)
+            # to satisfy min_samples=15 and exercise full bootstrap resampling
+            for k in range(15):
+                dir_t = brain_dir / f"conv-target-{k}" / ".system_generated" / "logs"
+                dir_t.mkdir(parents=True)
+                steps_t = [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": f"2026-04-12T10:{k:02d}:00Z",
+                        "content": "Hello",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": f"2026-04-12T10:{k:02d}:05Z",
+                        "content": "Done",
+                        "input_tokens": 100,
+                        "cache_read_tokens": 200,
+                        "output_tokens": 50,
+                    },
+                ]
+                (dir_t / "transcript.jsonl").write_text(
+                    "\n".join(json.dumps(s) for s in steps_t) + "\n", encoding="utf-8"
+                )
 
-            # Baseline session (2026-04-08)
-            dir_b = brain_dir / "conv-baseline" / ".system_generated" / "logs"
-            dir_b.mkdir(parents=True)
-            steps_b = [
-                {
-                    "step_index": 0,
-                    "type": "USER_INPUT",
-                    "source": "USER_EXPLICIT",
-                    "created_at": "2026-04-08T10:00:00Z",
-                    "content": "Hello",
-                },
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "created_at": "2026-04-12T10:00:05Z",
-                    "content": "Done",
-                    "input_tokens": 300,
-                    "cache_read_tokens": 400,
-                    "output_tokens": 70,
-                },
-            ]
-            (dir_b / "transcript.jsonl").write_text(
-                "\n".join(json.dumps(s) for s in steps_b) + "\n", encoding="utf-8"
-            )
+                dir_b = brain_dir / f"conv-baseline-{k}" / ".system_generated" / "logs"
+                dir_b.mkdir(parents=True)
+                steps_b = [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": f"2026-04-08T10:{k:02d}:00Z",
+                        "content": "Hello",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": f"2026-04-08T10:{k:02d}:05Z",
+                        "content": "Done",
+                        "input_tokens": 300,
+                        "cache_read_tokens": 400,
+                        "output_tokens": 70,
+                    },
+                ]
+                (dir_b / "transcript.jsonl").write_text(
+                    "\n".join(json.dumps(s) for s in steps_b) + "\n", encoding="utf-8"
+                )
 
             captured_calls = []
             orig_bootstrap = audit_trajectories.bootstrap_conversation_diff
@@ -513,12 +514,105 @@ class TestAuditTrajectories(unittest.TestCase):
                 self.assertIn("api_context", boot_tests)
 
                 # Check captured bootstrap call for api_context:
-                # Should resample t_api_context = [100 + 200 = 300] and b_api_context = [300 + 400 = 700]
+                # Should resample t_api_context = [100 + 200 = 300] * 15 and b_api_context = [300 + 400 = 700] * 15
                 # NOT [350] or [770] which include model output
                 matching_calls = [
-                    (t, b) for t, b, fn in captured_calls if t == [300] and b == [700]
+                    (t, b)
+                    for t, b, fn in captured_calls
+                    if t == [300] * 15 and b == [700] * 15
                 ]
                 self.assertEqual(len(matching_calls), 1)
+
+                # Resampling was performed and yielded a significant result
+                self.assertTrue(boot_tests["api_context"]["significant"])
+                self.assertEqual(boot_tests["api_context"]["p_value"], 0.0)
+
+    def test_auto_exclude_audit_detects_actions_after_line_25_and_arguments_key(self):
+        """auto_exclude_audit should detect audit actions after line 25 and handle tool_calls using 'arguments'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain_dir = tmp_path / "brain"
+
+            # Session 1: 30 normal conversation steps, then step 31 executes audit_trajectories.py
+            dir_1 = brain_dir / "conv-late-audit" / ".system_generated" / "logs"
+            dir_1.mkdir(parents=True)
+            steps_1 = [
+                {
+                    "step_index": idx,
+                    "type": "USER_INPUT" if idx % 2 == 0 else "PLANNER_RESPONSE",
+                    "source": "USER_EXPLICIT" if idx % 2 == 0 else "MODEL",
+                    "created_at": f"2026-04-12T10:{idx:02d}:00Z",
+                    "content": f"Step {idx}",
+                }
+                for idx in range(30)
+            ]
+            steps_1.append(
+                {
+                    "step_index": 30,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-04-12T10:30:05Z",
+                    "content": "Running audit now...",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "arguments": {
+                                "CommandLine": "python3 skills/improve-agent-efficiency/scripts/audit_trajectories.py"
+                            },
+                        }
+                    ],
+                }
+            )
+            (dir_1 / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(s) for s in steps_1) + "\n", encoding="utf-8"
+            )
+
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir],
+                {},
+                max_conversations=10,
+                auto_exclude_audit=True,
+            )
+            self.assertEqual(len(convs), 0)
+
+    def test_active_workspaces_takes_precedence_over_command_working_directory(self):
+        """Workspace entries under 'Active Workspaces:' should take precedence over 'Command Working Directory:'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ws_dir = tmp_path / "primary-workspace"
+            cwd_dir = tmp_path / "scratch-cwd"
+            (ws_dir / ".git").mkdir(parents=True)
+            (cwd_dir / ".git").mkdir(parents=True)
+
+            brain_dir = tmp_path / "brain"
+            c_dir = brain_dir / "conv-order-test" / ".system_generated" / "logs"
+            c_dir.mkdir(parents=True)
+            content = (
+                "<user_information>\n"
+                "The USER's OS version is mac.\n"
+                f"Command Working Directory: {cwd_dir}\n"
+                "Active Workspaces:\n"
+                f"- {ws_dir}\n"
+                "</user_information>\n"
+            )
+            step = {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": "2026-04-01T10:00:00Z",
+                "content": content,
+            }
+            (c_dir / "transcript.jsonl").write_text(
+                json.dumps(step) + "\n", encoding="utf-8"
+            )
+
+            norm_ws = audit_trajectories.norm_path(str(ws_dir))
+            norm_cwd = audit_trajectories.norm_path(str(cwd_dir))
+            candidate_repos = {norm_ws: str(ws_dir), norm_cwd: str(cwd_dir)}
+
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir], candidate_repos, max_conversations=10
+            )
+            self.assertEqual(len(convs), 1)
+            self.assertEqual(convs[0]["repo_path"], str(ws_dir))
 
 
 class TestProbeEnvironment(unittest.TestCase):

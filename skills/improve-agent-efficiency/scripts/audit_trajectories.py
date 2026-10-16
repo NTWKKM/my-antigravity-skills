@@ -488,7 +488,7 @@ def parse_conversations(
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
                     for line_idx, line in enumerate(f):
-                        if line_idx > 25:
+                        if not auto_exclude_audit and line_idx > 25:
                             break
                         line_str = line.strip()
                         if not line_str:
@@ -524,13 +524,17 @@ def parse_conversations(
                                     or "antigravity token usage analysis" in c_low
                                 ):
                                     is_audit_session = True
+                                    break
 
                             # 2. Action evidence from executed audit commands
                             for tc in d0.get("tool_calls", []) or []:
                                 if tc.get("name") == "run_command":
-                                    cmd = (
-                                        tc.get("args", {}).get("CommandLine") or ""
-                                    ).lower()
+                                    tc_args = (
+                                        tc.get("args") or tc.get("arguments") or {}
+                                    )
+                                    if not isinstance(tc_args, dict):
+                                        continue
+                                    cmd = (tc_args.get("CommandLine") or "").lower()
                                     if any(
                                         s in cmd
                                         for s in [
@@ -543,6 +547,8 @@ def parse_conversations(
                                     ):
                                         is_audit_session = True
                                         break
+                            if is_audit_session:
+                                break
             except Exception:
                 pass
 
@@ -690,6 +696,7 @@ def parse_conversations(
 
             if "<user_information>" in content:
                 in_active_ws_block = False
+                fallback_cwd = ""
                 for line in content.split("\n"):
                     s_line = line.strip()
                     low_line = s_line.lower()
@@ -697,7 +704,7 @@ def parse_conversations(
                     ws_idx = low_line.find(ws_marker)
                     if ws_idx != -1:
                         cand = s_line[ws_idx + len(ws_marker) :].strip().rstrip(".")
-                        if cand:
+                        if cand and not active_ws:
                             active_ws = norm_path(cand)
                     elif low_line.startswith("active workspaces:"):
                         in_active_ws_block = True
@@ -708,13 +715,13 @@ def parse_conversations(
                                 active_ws = norm_path(cand)
                         else:
                             in_active_ws_block = False
-                    if (
-                        low_line.startswith("command working directory:")
-                        and not active_ws
-                    ):
+                    elif low_line.startswith("command working directory:"):
                         cand = s_line.split(":", 1)[-1].strip()
-                        if cand:
-                            active_ws = norm_path(cand)
+                        if cand and not fallback_cwd:
+                            fallback_cwd = norm_path(cand)
+
+                if not active_ws and fallback_cwd:
+                    active_ws = fallback_cwd
 
                 if active_ws:
                     git_root = find_git_root(active_ws)
