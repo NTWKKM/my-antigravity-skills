@@ -190,6 +190,7 @@ def discover_ide_workspaces(ws_storage_dir):
 def discover_git_repositories(ide_workspaces, base_dir):
     repos = {}
     search_dirs = [
+        Path.home(),
         Path.home() / "Documents" / "repos",
         Path.home() / "Documents" / "Projects",
         Path.home() / "Projects",
@@ -200,18 +201,27 @@ def discover_git_repositories(ide_workspaces, base_dir):
         Path.home() / "workspace",
         Path.home() / "workspaces",
         Path.home() / "Documents",
+        Path.home() / "Desktop",
         base_dir / "scratch",
     ]
 
+    cwd_git = find_git_root(os.getcwd())
+    if cwd_git:
+        repos[norm_path(cwd_git)] = cwd_git
+
     for sd in search_dirs:
         if sd.exists():
-            if (sd / ".git").exists():
+            if sd != Path.home() and (sd / ".git").exists():
                 np = norm_path(str(sd))
                 repos[np] = str(sd.resolve())
             else:
                 try:
                     for child in sd.iterdir():
-                        if child.is_dir() and (child / ".git").exists():
+                        if (
+                            child.is_dir()
+                            and not child.name.startswith(".")
+                            and (child / ".git").exists()
+                        ):
                             np = norm_path(str(child))
                             repos[np] = str(child.resolve())
                 except Exception:
@@ -505,15 +515,13 @@ def parse_conversations(
 
             # Auto-exclude audit sessions (current active session or sessions executing trajectory audit)
             if auto_exclude_audit:
-                if item.name == "9594bcbb-d8fb-4482-bb7d-3e80af28a13e":
-                    continue
                 if any(
                     k in first_step_text
                     for k in [
                         "audit_trajectories.py",
+                        "probe_environment.py",
                         "/improve-agent-efficiency",
                         "improve-agent-efficiency",
-                        "efficiency status และ token burn",
                     ]
                 ):
                     continue
@@ -529,10 +537,15 @@ def parse_conversations(
 
     conv_candidates.sort(key=lambda x: x[0], reverse=True)
     total_candidates = len(conv_candidates)
-    if max_conversations and max_conversations > 0:
-        conv_candidates = conv_candidates[:max_conversations]
 
     for mtime, item, tpath, conv_dt in conv_candidates:
+        if (
+            not compare_mode
+            and max_conversations
+            and max_conversations > 0
+            and len(conversations) >= max_conversations
+        ):
+            break
         first_prompt = ""
         user_prompts = []
         active_ws = ""
@@ -636,13 +649,68 @@ def parse_conversations(
                 total_tool_output_chars += len(content)
 
             if "<user_information>" in content:
+                in_active_ws_block = False
                 for line in content.split("\n"):
-                    if "active workspace is" in line.lower():
-                        cand = line.split("active workspace is")[-1].strip().rstrip(".")
+                    s_line = line.strip()
+                    low_line = s_line.lower()
+                    if "active workspace is" in low_line:
+                        cand = (
+                            s_line.split("active workspace is")[-1].strip().rstrip(".")
+                        )
+                        if cand:
+                            active_ws = norm_path(cand)
+                    elif low_line.startswith("active workspaces:"):
+                        in_active_ws_block = True
+                    elif in_active_ws_block:
+                        if s_line.startswith("- "):
+                            cand = s_line[2:].strip()
+                            if cand and not active_ws:
+                                active_ws = norm_path(cand)
+                        else:
+                            in_active_ws_block = False
+                    if (
+                        low_line.startswith("command working directory:")
+                        and not active_ws
+                    ):
+                        cand = s_line.split(":", 1)[-1].strip()
                         if cand:
                             active_ws = norm_path(cand)
 
+                if active_ws:
+                    git_root = find_git_root(active_ws)
+                    if git_root:
+                        gn = norm_path(git_root)
+                        if gn not in candidate_repos:
+                            candidate_repos[gn] = git_root
+                            sorted_repo_norms = sorted(
+                                list(candidate_repos.keys()),
+                                key=lambda x: len(x),
+                                reverse=True,
+                            )
+
             tc_list = step.get("tool_calls", [])
+            # Collect subsequent non-ephemeral tool result steps up to next planner/user boundary
+            tool_result_steps = []
+            if tc_list:
+                for j in range(i + 1, len(steps)):
+                    sj = steps[j]
+                    st_j = sj.get("type", "")
+                    src_j = sj.get("source", "")
+                    if (
+                        st_j in ["PLANNER_RESPONSE", "USER_INPUT"]
+                        or src_j == "USER_EXPLICIT"
+                    ):
+                        break
+                    if st_j in [
+                        "EPHEMERAL_MESSAGE",
+                        "SYSTEM_MESSAGE",
+                        "CHECKPOINT",
+                        "CONVERSATION_HISTORY",
+                    ] or src_j in ["SYSTEM_SDK", "SYSTEM"]:
+                        continue
+                    tool_result_steps.append(sj)
+
+            used_cmd_step_ids = set()
             for tc_idx, tc in enumerate(tc_list):
                 tname = tc.get("name")
                 args = tc.get("args") or tc.get("arguments") or {}
@@ -702,9 +770,8 @@ def parse_conversations(
                     e_line = args.get("EndLine")
                     is_bounded = s_line is not None and e_line is not None
                     v_len = 0
-                    t_idx = i + tc_idx + 1
-                    if t_idx < len(steps):
-                        v_len = len(steps[t_idx].get("content", "") or "")
+                    if tc_idx < len(tool_result_steps):
+                        v_len = len(tool_result_steps[tc_idx].get("content", "") or "")
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
@@ -723,12 +790,23 @@ def parse_conversations(
                 elif tname == "run_command":
                     exit_code = None
                     resp_content = ""
-                    for j in range(i + tc_idx + 1, min(i + tc_idx + 4, len(steps))):
-                        m_content = steps[j].get("content", "")
+                    # Prefer matching positional tool_result_steps[tc_idx] first, then scan all tool_result_steps
+                    candidate_steps = []
+                    if tc_idx < len(tool_result_steps):
+                        candidate_steps.append((tc_idx, tool_result_steps[tc_idx]))
+                    for r_idx, r_step in enumerate(tool_result_steps):
+                        if r_idx != tc_idx:
+                            candidate_steps.append((r_idx, r_step))
+
+                    for r_idx, r_step in candidate_steps:
+                        if r_idx in used_cmd_step_ids:
+                            continue
+                        m_content = r_step.get("content", "") or ""
                         if (
                             "exited with code" in m_content
                             or "finished with result:" in m_content
                         ):
+                            used_cmd_step_ids.add(r_idx)
                             resp_content = m_content
                             m = re.search(r"exited with code (-?\d+)", m_content)
                             if m:
@@ -1426,29 +1504,6 @@ def bootstrap_conversation_diff(
     return low, high, p_val, is_significant
 
 
-def is_statistically_significant(c_events, c_total, b_events, b_total, min_samples=30):
-    if c_events is None or b_events is None or c_total is None or b_total is None:
-        return False
-    if c_total < min_samples or b_total < min_samples:
-        return False
-    if c_total <= 0 or b_total <= 0:
-        return False
-    p1 = c_events / c_total
-    p2 = b_events / b_total
-    p_pool = (c_events + b_events) / (c_total + b_total)
-    if p_pool <= 0 or p_pool >= 1:
-        return False
-    smaller_total = min(c_total, b_total)
-    min_expected_cell = smaller_total * min(p_pool, 1.0 - p_pool)
-    if min_expected_cell < 5:
-        return False
-    se = (p_pool * (1 - p_pool) * (1 / c_total + 1 / b_total)) ** 0.5
-    if se == 0:
-        return False
-    z = abs(p1 - p2) / se
-    return z >= 1.96
-
-
 def format_delta(
     current,
     baseline,
@@ -1505,14 +1560,32 @@ def run_inventory(output_dir=None):
                 or item.name in seen_ids
             ):
                 continue
-            tpath = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath_full = item / ".system_generated" / "logs" / "transcript_full.jsonl"
+            tpath_compact = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath = tpath_full if tpath_full.exists() else tpath_compact
             if not tpath.exists():
                 continue
             seen_ids.add(item.name)
             total_convs += 1
             try:
-                mtime = os.path.getmtime(tpath)
-                dt = datetime.fromtimestamp(mtime)
+                dt = None
+                with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        d0 = json.loads(line_str)
+                        c_str = d0.get("created_at")
+                        if c_str:
+                            dt = (
+                                datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                                .astimezone()
+                                .replace(tzinfo=None)
+                            )
+                        break
+                if dt is None:
+                    mtime = os.path.getmtime(tpath)
+                    dt = datetime.fromtimestamp(mtime)
                 if earliest_dt is None or dt < earliest_dt:
                     earliest_dt = dt
                 if latest_dt is None or dt > latest_dt:
@@ -1681,6 +1754,9 @@ def run_audit(
         # Partition conversations by start timestamp
         target_convs = [c for c in all_convs if c["dt"] >= since_dt]
         baseline_convs = [c for c in all_convs if c["dt"] < since_dt]
+        if max_conversations and max_conversations > 0:
+            target_convs = target_convs[:max_conversations]
+            baseline_convs = baseline_convs[:max_conversations]
 
         target_summary = calculate_cohort_summary(target_convs)
         baseline_summary = calculate_cohort_summary(baseline_convs)

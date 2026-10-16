@@ -20,7 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 try:
     import tomllib
@@ -92,7 +92,9 @@ USER_HOME_PATH_RE = re.compile(
     r"(?:[A-Za-z]:(?:\\{1,4}|/)+|/|\\{1,4})(?:Users|home|Documents and Settings)(?:\\{1,4}|/)+[A-Za-z0-9_.-]+(?:\\{1,4}|/)+",
     re.IGNORECASE,
 )
-UNIX_USER_PATH_RE = re.compile(r"^/(?:Users|home)/[A-Za-z0-9_.-]+(?:/|$)", re.IGNORECASE)
+UNIX_USER_PATH_RE = re.compile(
+    r"^/(?:Users|home)/[A-Za-z0-9_.-]+(?:/|$)", re.IGNORECASE
+)
 USER_FILE_URI_RE = re.compile(
     r"file:///(?:[A-Za-z]:/(?:Users|Documents and Settings|home)|(?:Users|home)/)",
     re.IGNORECASE,
@@ -100,14 +102,19 @@ USER_FILE_URI_RE = re.compile(
 
 try:
     CURRENT_USER = getpass.getuser()
-    if CURRENT_USER and len(CURRENT_USER) > 1 and CURRENT_USER.lower() not in {
-        "root",
-        "runner",
-        "github",
-        "administrator",
-        "system",
-        "default",
-    }:
+    if (
+        CURRENT_USER
+        and len(CURRENT_USER) > 1
+        and CURRENT_USER.lower()
+        not in {
+            "root",
+            "runner",
+            "github",
+            "administrator",
+            "system",
+            "default",
+        }
+    ):
         ACTIVE_USER_PATH_RE = re.compile(
             rf"(?:\\{{1,4}}|/)+{re.escape(CURRENT_USER)}(?:\\{{1,4}}|/)+",
             re.IGNORECASE,
@@ -118,11 +125,19 @@ except Exception:
     ACTIVE_USER_PATH_RE = None
 
 SECRET_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"-----BEGIN (?:RSA|OPENSSH|EC|DSA|PGP)?\s?PRIVATE KEY-----"), "Private Key Header"),
+    (
+        re.compile(r"-----BEGIN (?:RSA|OPENSSH|EC|DSA|PGP)?\s?PRIVATE KEY-----"),
+        "Private Key Header",
+    ),
     (re.compile(r"\b(?:sk|pk)_(?:live|test)_[0-9a-zA-Z]{24,}\b"), "API Key Token"),
     (re.compile(r"\bghp_[0-9a-zA-Z]{36}\b"), "GitHub Personal Access Token"),
     (re.compile(r"\bgho_[0-9a-zA-Z]{36}\b"), "GitHub OAuth Access Token"),
-    (re.compile(r"\beyJ[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}\b"), "JWT Token"),
+    (
+        re.compile(
+            r"\beyJ[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}\.[a-zA-Z0-9_\-]{20,}\b"
+        ),
+        "JWT Token",
+    ),
     (
         re.compile(
             r"\b[A-Za-z0-9._%+-]+@(?!(?:example\.com|users\.noreply\.github\.com|domain\.com)\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
@@ -145,13 +160,18 @@ def resolve_repo_root(start_dir: Optional[str] = None) -> Path:
 def get_git_tracked_files(repo_root: Path) -> List[str]:
     try:
         res = subprocess.run(
-            ["git", "ls-files"],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
             cwd=str(repo_root),
             capture_output=True,
             text=True,
             check=True,
         )
-        return [line.strip().replace("\\", "/") for line in res.stdout.splitlines() if line.strip()]
+        out = []
+        for line in res.stdout.splitlines():
+            rel = line.strip().replace("\\", "/")
+            if rel and (repo_root / rel).is_file():
+                out.append(rel)
+        return sorted(set(out))
     except Exception:
         files = []
         for root, dirs, filenames in os.walk(str(repo_root)):
@@ -172,7 +192,9 @@ def check_file_hygiene(repo_root: Path, rel_path: str) -> List[str]:
 
     ext = file_path.suffix.lower()
     if ext in DISALLOWED_BINARY_EXTENSIONS:
-        violations.append(f"{rel_path}: Tracked binary or build artifact extension ({ext})")
+        violations.append(
+            f"{rel_path}: Tracked binary or build artifact extension ({ext})"
+        )
         return violations
 
     if ext in IGNORED_EXTENSIONS or file_path.name in IGNORED_FILES:
@@ -195,19 +217,35 @@ def check_file_hygiene(repo_root: Path, rel_path: str) -> List[str]:
             is_placeholder = bool(doc_placeholder_re.search(line))
 
             if WINDOWS_USER_PATH_RE.search(line) and not is_placeholder:
-                violations.append(f"{rel_path}:{line_no}: Hardcoded Windows user directory path leak: {line.strip()[:100]}")
+                violations.append(
+                    f"{rel_path}:{line_no}: Hardcoded Windows user directory path leak: {line.strip()[:100]}"
+                )
             if USER_HOME_PATH_RE.search(line) and not is_placeholder:
-                violations.append(f"{rel_path}:{line_no}: Hardcoded user profile directory path: {line.strip()[:100]}")
+                violations.append(
+                    f"{rel_path}:{line_no}: Hardcoded user profile directory path: {line.strip()[:100]}"
+                )
             if UNIX_USER_PATH_RE.search(line) and not is_placeholder:
-                violations.append(f"{rel_path}:{line_no}: Hardcoded Unix user home directory path: {line.strip()[:100]}")
-            if ACTIVE_USER_PATH_RE and ACTIVE_USER_PATH_RE.search(line) and not is_placeholder:
-                violations.append(f"{rel_path}:{line_no}: Active OS user path component leak: {line.strip()[:100]}")
+                violations.append(
+                    f"{rel_path}:{line_no}: Hardcoded Unix user home directory path: {line.strip()[:100]}"
+                )
+            if (
+                ACTIVE_USER_PATH_RE
+                and ACTIVE_USER_PATH_RE.search(line)
+                and not is_placeholder
+            ):
+                violations.append(
+                    f"{rel_path}:{line_no}: Active OS user path component leak: {line.strip()[:100]}"
+                )
             if USER_FILE_URI_RE.search(line) and not is_placeholder:
-                violations.append(f"{rel_path}:{line_no}: Local user file URI (file:///): {line.strip()[:100]}")
+                violations.append(
+                    f"{rel_path}:{line_no}: Local user file URI (file:///): {line.strip()[:100]}"
+                )
 
             for pattern, desc in SECRET_PATTERNS:
                 if pattern.search(line):
-                    violations.append(f"{rel_path}:{line_no}: Potential secret/credential ({desc}): {line.strip()[:60]}...")
+                    violations.append(
+                        f"{rel_path}:{line_no}: Potential secret/credential ({desc}): {line.strip()[:60]}..."
+                    )
 
     except Exception as ex:
         violations.append(f"{rel_path}: Failed to read file ({ex})")
@@ -217,53 +255,150 @@ def check_file_hygiene(repo_root: Path, rel_path: str) -> List[str]:
 
 def check_manifest_integrity(repo_root: Path) -> List[str]:
     violations: List[str] = []
+
+    # 1. Validate legacy manifest.json if present
     manifest_path = repo_root / "manifest.json"
-    if not manifest_path.exists():
-        return violations
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            plugins = data.get("plugins", {})
+            if not isinstance(plugins, dict):
+                violations.append(
+                    "manifest.json: 'plugins' key must be an object dictionary"
+                )
+            else:
+                for plugin_name, meta in plugins.items():
+                    rel_dir = meta.get("path", f"plugins/{plugin_name}")
+                    plugin_dir = repo_root / rel_dir
 
-        plugins = data.get("plugins", {})
-        if not isinstance(plugins, dict):
-            violations.append("manifest.json: 'plugins' key must be an object dictionary")
-            return violations
-
-        for plugin_name, meta in plugins.items():
-            rel_dir = meta.get("path", f"plugins/{plugin_name}")
-            plugin_dir = repo_root / rel_dir
-
-            if not plugin_dir.exists():
-                violations.append(f"manifest.json: Plugin '{plugin_name}' path does not exist on disk: {rel_dir}")
-                continue
-
-            metadata_toml = plugin_dir / "metadata.toml"
-            if not metadata_toml.exists():
-                violations.append(f"manifest.json: Plugin '{plugin_name}' missing metadata.toml at {metadata_toml}")
-                continue
-
-            if tomllib:
-                try:
-                    with open(metadata_toml, "rb") as mf:
-                        mdata = tomllib.load(mf)
-                    if mdata.get("name") != plugin_name:
+                    if not plugin_dir.exists():
                         violations.append(
-                            f"{rel_dir}/metadata.toml: Name mismatch (declared '{mdata.get('name')}', expected '{plugin_name}')"
+                            f"manifest.json: Plugin '{plugin_name}' path does not exist on disk: {rel_dir}"
                         )
-                except Exception as mex:
-                    violations.append(f"{rel_dir}/metadata.toml: Parse error ({mex})")
+                        continue
 
-    except Exception as ex:
-        violations.append(f"manifest.json: Parse failed ({ex})")
+                    metadata_toml = plugin_dir / "metadata.toml"
+                    if not metadata_toml.exists():
+                        violations.append(
+                            f"manifest.json: Plugin '{plugin_name}' missing metadata.toml at {metadata_toml}"
+                        )
+                        continue
+
+                    if tomllib:
+                        try:
+                            with open(metadata_toml, "rb") as mf:
+                                mdata = tomllib.load(mf)
+                            if mdata.get("name") != plugin_name:
+                                violations.append(
+                                    f"{rel_dir}/metadata.toml: Name mismatch (declared '{mdata.get('name')}', expected '{plugin_name}')"
+                                )
+                        except Exception as mex:
+                            violations.append(
+                                f"{rel_dir}/metadata.toml: Parse error ({mex})"
+                            )
+        except Exception as ex:
+            violations.append(f"manifest.json: Parse failed ({ex})")
+
+    # 2. Validate Antigravity plugin.json if present
+    plugin_json_path = repo_root / "plugin.json"
+    if plugin_json_path.exists():
+        try:
+            pdata = json.loads(plugin_json_path.read_text(encoding="utf-8"))
+            if not isinstance(pdata, dict):
+                violations.append("plugin.json: Root payload must be a JSON object")
+            elif "name" in pdata and (
+                not isinstance(pdata["name"], str) or not pdata["name"].strip()
+            ):
+                violations.append(
+                    "plugin.json: 'name' field must be a non-empty string"
+                )
+        except Exception as ex:
+            violations.append(f"plugin.json: Parse failed ({ex})")
+
+    # 3. Validate Antigravity .agents/skills.json if present
+    skills_json_path = repo_root / ".agents" / "skills.json"
+    if skills_json_path.exists():
+        try:
+            sdata = json.loads(skills_json_path.read_text(encoding="utf-8"))
+            if not isinstance(sdata, dict):
+                violations.append(
+                    ".agents/skills.json: Root payload must be a JSON object"
+                )
+            else:
+                entries = sdata.get("entries", [])
+                if not isinstance(entries, list):
+                    violations.append(".agents/skills.json: 'entries' must be a list")
+                else:
+                    for entry in entries:
+                        epath = entry.get("path") if isinstance(entry, dict) else None
+                        if not epath or not isinstance(epath, str):
+                            violations.append(
+                                ".agents/skills.json: Each entry must specify a string 'path'"
+                            )
+                        elif not epath.startswith("/") and not epath.startswith("~/"):
+                            resolved = repo_root / epath
+                            if not resolved.exists():
+                                violations.append(
+                                    f".agents/skills.json: Entry path does not exist: {epath}"
+                                )
+        except Exception as ex:
+            violations.append(f".agents/skills.json: Parse failed ({ex})")
+
+    # 4. Validate skills/*/SKILL.md YAML frontmatter
+    skills_dir = repo_root / "skills"
+    if skills_dir.exists() and skills_dir.is_dir():
+        for skill_item in sorted(skills_dir.iterdir()):
+            if not skill_item.is_dir() or skill_item.name.startswith("."):
+                continue
+            skill_md = skill_item / "SKILL.md"
+            rel_md = f"skills/{skill_item.name}/SKILL.md"
+            if not skill_md.exists():
+                violations.append(f"{rel_md}: Missing required SKILL.md file")
+                continue
+            try:
+                text = skill_md.read_text(encoding="utf-8")
+                if not text.startswith("---\n") and not text.startswith("---\r\n"):
+                    violations.append(
+                        f"{rel_md}: Missing YAML frontmatter opening '---'"
+                    )
+                    continue
+                parts = re.split(r"^---\s*$", text, maxsplit=2, flags=re.MULTILINE)
+                if len(parts) < 3:
+                    violations.append(f"{rel_md}: Unclosed YAML frontmatter block")
+                    continue
+                fm = parts[1]
+                name_match = re.search(r"^name:\s*(.+)$", fm, flags=re.MULTILINE)
+                desc_match = re.search(r"^description:\s*(.+)$", fm, flags=re.MULTILINE)
+                if not name_match or not name_match.group(1).strip():
+                    violations.append(
+                        f"{rel_md}: Frontmatter missing required 'name' field"
+                    )
+                elif name_match.group(1).strip().strip("\"'") != skill_item.name:
+                    violations.append(
+                        f"{rel_md}: Frontmatter name '{name_match.group(1).strip()}' does not match directory '{skill_item.name}'"
+                    )
+                if not desc_match or not desc_match.group(1).strip():
+                    violations.append(
+                        f"{rel_md}: Frontmatter missing required 'description' field"
+                    )
+            except Exception as ex:
+                violations.append(f"{rel_md}: Failed to validate SKILL.md ({ex})")
 
     return violations
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Repository Safety, Secret & Path Hygiene Scanner")
-    parser.add_argument("--repo-root", default=None, help="Root directory of the repository to scan")
-    parser.add_argument("--skip-manifest", action="store_true", help="Skip manifest integrity checks")
+    parser = argparse.ArgumentParser(
+        description="Repository Safety, Secret & Path Hygiene Scanner"
+    )
+    parser.add_argument(
+        "--repo-root", default=None, help="Root directory of the repository to scan"
+    )
+    parser.add_argument(
+        "--skip-manifest", action="store_true", help="Skip manifest integrity checks"
+    )
     args = parser.parse_args()
 
     repo_root = resolve_repo_root(args.repo_root)
@@ -285,7 +420,9 @@ def main() -> int:
         print(f"\nTotal violations: {len(all_violations)}")
         return 1
 
-    print("\n[PASSED] Zero path leaks, secrets, binary artifacts, or manifest inconsistencies detected.")
+    print(
+        "\n[PASSED] Zero path leaks, secrets, binary artifacts, or manifest inconsistencies detected."
+    )
     return 0
 
 
