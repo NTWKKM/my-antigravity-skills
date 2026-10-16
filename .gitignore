@@ -5,6 +5,8 @@ __pycache__/
 
 # Output and temporary artifacts
 *.json
+!plugin.json
+!.agents/*.json
 !skills/**/validation*.json
 scratch/
 temp/

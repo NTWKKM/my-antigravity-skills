@@ -16,7 +16,13 @@ The `check_repo_safety.py` scanner validates tracked files against three risk ca
 * **Personal Emails:** Plain email addresses matching real domains (ignores `example.com`, `domain.com`, `users.noreply.github.com`).
 
 ## 3. Disallowed Binary Blobs
-* Flags tracked binary extensions: `.dll`, `.exe`, `.pdb`, `.so`, `.dylib`, `.pyc`, `.class`, `.zip`, `.tar.gz`, `.7z`, `.bin`.
+* Flags tracked binary extensions: `.dll`, `.exe`, `.pdb`, `.so`, `.dylib`, `.pyc`, `.pyo`, `.pyd`, `.class`, `.zip`, `.tar.gz`, `.tgz`, `.7z`, `.bin`.
+
+## 4. Antigravity & Plugin Manifest Integrity
+* **`plugin.json`:** Verifies valid JSON object structure and non-empty `name` field when present.
+* **`.agents/skills.json`:** Verifies valid JSON object structure and confirms all workspace-relative `entries[].path` targets exist on disk.
+* **`skills/*/SKILL.md`:** Verifies that every skill directory contains a `SKILL.md` with valid YAML frontmatter (`---`), a `name` matching the directory name, and a non-empty `description`.
+* **`manifest.json`:** Validates legacy plugin paths and `metadata.toml` alignment when present.
 
 ## Inline Exclusions
 To intentionally bypass detection for test fixtures or mock payloads:

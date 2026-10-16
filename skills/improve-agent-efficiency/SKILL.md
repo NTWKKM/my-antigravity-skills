@@ -1,106 +1,73 @@
 ---
 name: improve-agent-efficiency
-description: Probes host development tools, mines causal command failure chains across past agent sessions, measures token burn and efficiency gains, and executes verified remediation across host binaries, global rules, and workspace AGENTS.md files.
+description: Audits Antigravity agent conversation transcripts, probes host CLI tooling and rule budgets, measures token burn and comparative efficiency gains via conversation-level bootstrap testing, and deploys verified remediations across host binaries, hooks.json, global rules, and workspace AGENTS.md files. Use when the user asks to check token burn, evaluate efficiency gains since a date, audit command failure rates or retry loops across past sessions, or optimize GEMINI.md, AGENTS.md, and hooks.json.
 ---
 
 # Improve Agent Efficiency
 
-This skill audits agent conversation histories in Antigravity, detects execution friction and multi-turn retry loops, probes the live host environment for tool discrepancies, evaluates comparative efficiency gains and token burn over time, and executes verified systemic remediations.
+This skill audits agent conversation histories in Antigravity (Antigravity 2.0, IDE, and CLI), detects execution friction and multi-turn retry loops, probes the live host environment and rule context budgets, evaluates comparative efficiency gains and token burn over time, and executes verified systemic remediations.
 
 ---
 
-## Direct Chat Prompts
-
-The workflow supports two distinct operational modes depending on user intent:
+## Operational Modes
 
 ### Mode A: Status, Efficiency Gains & Token Burn Check (Read-Only)
-When the user wants to inspect recent performance or verify if previous remediations worked:
+Trigger when the user wants to inspect recent performance or verify whether previous rule/hook updates worked:
 - *"Check our efficiency status and token burn over the last 24 hours."*
 - *"Analyze our efficiency gains since yesterday."*
 - *"Did our recent rule updates reduce command failures and token burn?"*
-- *"Show me token expenditure and command failure metrics since last week."*
 
-**Fast Execution Path:** Run `audit_trajectories.py (Get-Location).Path --since <YYYY-MM-DD> --compare` (or `--since 24h`), report the comparative delta table directly to the user, and complete the turn without running unnecessary host probes or modifying configurations.
+**Fast Execution Path:**
+Run [`scripts/audit_trajectories.py`](scripts/audit_trajectories.py) with `--since <YYYY-MM-DD> --compare` targeting the session scratch directory (`<appDataDir>/brain/<conversation-id>/scratch`), report the comparative delta table directly to the user, and complete the turn without running host probes or modifying configurations.
 
-**Critical Analytical Discipline (Anti-Hallucination Gate):**
-- **Statistical Significance Guards on Labels:** Require conversation-level non-parametric bootstrapping for all rate and proportion metrics (such as command failure rate, high-friction loop rate, unbounded file view ratio, unmodified overlap ratio, and prompt cache hit rate) as well as continuous token metrics. Prohibit pooled $z$-tests on raw event counts because events cluster within conversation sessions (intra-cluster correlation / pseudoreplication), yielding artificially optimistic $p$-values. If evidence is insufficient ($N < 15$) or 0 falls within the 95% Bootstrap Confidence Interval, label the result `NEUTRAL`.
-- **Conversation-Level Unit of Analysis (Bootstrap Significance):** Statistical comparison must be conducted at the conversation level using non-parametric bootstrap (e.g. 1,000 resamples) with pooled-ratio statistics for rate metrics and appropriate location statistics (e.g. median) for continuous token burn. Directional labels (`IMPROVED` / `DRIFT`) must only be assigned when the bootstrap confidence interval excludes zero.
-- **Beware of Tail Noise in High Percentiles:** High percentiles like P90 represent only a small fraction of sessions in the extreme tail (e.g. ~5 sessions when $N \approx 50$). Never label P90 shifts as `IMPROVED` or `DRIFT`; tag as `NOISE` or report bootstrap variance. Concurrently, evaluate per-session token shifts against user turn volume, as variations in turns per conversation directly confound raw token metrics.
-- **Distinguish Unmodified Re-Reading from Post-Edit Verification:** File overlap re-reading must differentiate between reading lines of an unmodified file (true redundant reading friction) vs legitimate post-edit inspection (checking line shifts or verifying diff application across modification epochs). Track modification epochs and reset line sets upon write/replace actions to quantify unmodified overlap separately from gross line revisits.
-- **Ephemeral Message Retention & Context Dynamics:** Verify ephemeral message persistence against the dataset by inspecting step-by-step delta analysis ($\Delta \text{input\_tokens}$) across turns. If runtime injections (such as `EPHEMERAL_MESSAGE` or `ACTIVE SKILLS LOADED`) are scoped per turn rather than persisted in conversation history, they will not compound quadratically ($O(S^2)$) across turns. Measure the actual prompt cache hit rate to quantify how much repetitive prompt overhead is absorbed by KV caching in the target environment.
-- **Whole-File Overwrite vs Surgical Replacement:** Measure the distribution of tool payload modes (differentiating `write_to_file` overwrite, append, and create modes against surgical edits via `replace_file_content`). Analyze the proportion of tool argument tokens consumed by whole-file rewrites to determine whether high tool argument volume stems from full-file overwriting rather than conversational output.
-- **Calibration Spread Across Conversations:** Rather than relying on a single scalar, report the distribution spread (median, IQR, min/max) of API output tokens vs estimated transcript tokens across conversations, and elevate native API telemetry as the primary cost truth.
-- **Log File Selection (`transcript_full.jsonl` vs `transcript.jsonl`):** Trajectory auditing must prefer `transcript_full.jsonl` whenever present. Compact `transcript.jsonl` truncates tool outputs (`"truncated_fields": ["content"]`), causing tool token calculations (such as file views and command outputs) to report misleadingly tiny sizes (~20 chars/call) and producing false-positive efficiency claims.
-- **Decompose Model Response:** Response output tokens must distinguish between visible assistant prose, tool call arguments (e.g. `write_to_file` payloads), and internal reasoning/thinking tokens. A high response volume typically reflects active code generation and large edit payloads, not conversational loquacity.
-- **Empirical Inline Script Classification & Repository Concentration:** Differentiate multi-line inline scripts (`py -c`, `node -e` with line breaks) from clean one-liners. Parse traceback tails (last lines of stderr) to classify all exception types (`missing_dependency`, `runtime_exception`, `syntax_shell_parse`, `assertion_or_logic`). In practice, missing dependencies cluster heavily in specific workspaces (e.g. unpinned virtualenvs), requiring repo-level `AGENTS.md` alignment rather than global shell syntax rules.
-- **Distinguish Intentional Non-Zero Exits:** TDD red-phase test assertions (`pytest` failing before writing code) and polling status (`gh pr checks` exit 8 pending) are normal workflow signals, not execution failures.
+**Analytical Guardrails (Anti-Hallucination Gate):**
+1. **Bootstrap Significance Guard:** All rate metrics (`failure_rate`, `friction_loops`, `unmodified_overlap`, `unbounded_views`, `prompt_cache_hit`) and continuous token metrics (`median_tokens`, `api_context`, `api_input_tokens`) are tested at the **conversation level** using 1,000-resample non-parametric bootstrapping. Assign `IMPROVED` or `DRIFT` strictly when $N \ge 15$ per cohort and $0$ is outside the 95% CI; otherwise report `NEUTRAL`.
+2. **Tail Variance & Turn Volume:** Treat `p90_tokens_per_conv` shifts as `NOISE` and always evaluate per-session token shifts alongside `turns_per_conv`.
+3. **Unmodified Re-Reading vs Post-Edit Verification:** Use `unmodified_overlap_pct` (lines re-read within the same file modification epoch) rather than `gross_overlap_pct` (which includes legitimate post-edit inspection).
+4. **Prompt Cache & API Ground Truth:** Elevate `api_tokens_ground_truth` (`cache_hit_rate_pct`, `fresh_input_per_conv`, `total_api_per_conv`) and its per-conversation calibration spread as primary cost truth.
+5. **Prefer Full Transcripts:** Always inspect `transcript_full.jsonl` over `transcript.jsonl` to avoid truncated tool outputs (`"truncated_fields": ["content"]`).
+6. **Benign Non-Zero Exits:** Zero-match searches (`rg`, `grep`, `findstr`, `diff` exit 1), TDD red-phase test runs, and pending `gh pr checks` (exit 8) are normal workflow signals, not command failures.
 
-### Mode B: Deep Friction Audit & Tri-Layer Remediation
-When the user wants to identify recurring errors, eliminate multi-turn loops, or update configurations:
-- *"Audit my past sessions and optimize agent rules."*
-- *"Check my command failure rate across past trajectories and update workspace AGENTS.md."*
-- *"Analyze execution friction across my projects and recommend host tooling fixes."*
-- *"Probe my host environment and identify discrepancies in my agent configuration."*
-
-**Full Remediation Path:** Follow the sequential phases below (Inventory -> Probe -> Deep Audit -> Sampling -> Remediation -> Verification). Before proposing any new rule in `GEMINI.md` or `AGENTS.md`, prove with actual transcript sampling that the friction is systematic, recurring, and causes material token/time waste. Avoid speculative rule additions (adhere strictly to YAGNI).
+For the complete JSON output schema and statistical formulas, read [`references/metrics_and_schema.md`](references/metrics_and_schema.md).
 
 ---
 
-## Architecture: Fast Probing, Causal Mining, and Verified Remediation
+### Mode B: Deep Friction Audit & Quad-Layer Remediation
+Trigger when the user wants to identify recurring errors, eliminate multi-turn loops, or harden configurations:
+- *"Audit my past sessions and optimize agent rules."*
+- *"Check my command failure rate across past trajectories and update workspace AGENTS.md."*
+- *"Probe my host environment and identify discrepancies in my agent configuration."*
 
-The workflow operates across six distinct phases:
-
-1. **Scoping & Discovery Gate (Interactive Selection):**
-   When invoked without arguments, a fast inventory scan enumerates repositories and date boundaries. The agent uses `ask_question` to let the user select the target project scope and time window before deep parsing begins.
-
-2. **Host Environment Probe (Local Script):**
-   `scripts/probe_environment.py` inspects the live host runtime, verifies installed CLI binaries (`git`, `gh`, `rg`, `python`, `dotnet`, `node`, `cargo`), tests standard output stream encoding, and cross-references active rules in `GEMINI.md` to identify false negative claims.
-
-3. **Causal Trajectory Mining & Gains Auditor (Local Script):**
-   `scripts/audit_trajectories.py` parses conversation logs, matches sessions to repositories via dynamic git discovery, disambiguates benign zero-match searches (`rg`, `findstr`, `grep`), reconstructs multi-turn incident chains (`initial failed command -> intermediate retries / file writes -> eventual working resolution`), and measures token burn and context metrics.
-
-4. **Targeted Forensic Sampling (Agent Reasoning):**
-   For the highest-friction incident chains, the agent uses bounded `view_file` calls directly on `transcript_full.jsonl` (preferring it over `transcript.jsonl` whenever present to avoid truncated tool outputs) to inspect the original prompt intent, raw error tracebacks, and tool execution context.
-
-5. **Tri-Layer Remediation Synthesis (Agent Execution):**
-   Interventions are partitioned into Host Tooling (package manager installs), Global Rules (`~/.gemini/config/GEMINI.md`), and Workspace Rules (`<repo_root>/AGENTS.md`).
-
-6. **Verification Gate (Live Execution):**
-   All applied environment configurations, shell rules, or workspace settings are tested using verification commands before completing the turn.
+**Full Remediation Path:** Execute Phases 0 through 5 below in order. Before adding any new rule to `GEMINI.md` or `AGENTS.md`, prove with transcript sampling that the friction is recurring and causes material waste (YAGNI), and prefer zero-token layers (host binaries, `hooks.json`) first.
 
 ---
 
 ## Operational Procedure
 
+Resolve `<SkillDir>` to the directory containing this `SKILL.md` file, and set `<ScratchDir>` to `<appDataDir>/brain/<conversation-id>/scratch` so generated JSON reports never pollute the user's git working tree.
+
 ### Phase 0: Scoping & Discovery Gate
 
 1. **Explicit Prompt Intent Check:**
-   - If the user asks for a **status check, efficiency gains, or token burn**, immediately execute the **Mode A** fast path:
-     ```pwsh
-     py -3.10 "$SkillScripts\audit_trajectories.py" (Get-Location).Path --since <YYYY-MM-DD> --compare
+   - If the user asks for a **status check, efficiency gains, or token burn**, run the **Mode A** fast path and stop after reporting:
+     ```bash
+     # macOS / Linux (POSIX)
+     python3 "<SkillDir>/scripts/audit_trajectories.py" "<ScratchDir>" --since <YYYY-MM-DD> --compare
      ```
-     Present findings and finish without running Phase 1-5.
-   - If the user designates a target repository (e.g. *"Audit Caster"*) or specific time window (e.g. *"since last week"*), bypass the interactive prompt and execute Phase 1 directly with `--repo <name>` or `--since <date>`.
+     ```pwsh
+     # Windows (PowerShell)
+     py -3.10 "<SkillDir>\scripts\audit_trajectories.py" "<ScratchDir>" --since <YYYY-MM-DD> --compare
+     ```
+   - If the user already specified a repository (`--repo <name>`) or date window (`--since <date>`), proceed directly to Phase 1.
 
 2. **Rapid Inventory Discovery (< 2 seconds):**
-   If invoked bare (e.g. `/improve-agent-efficiency`), execute the rapid inventory discovery mode:
-
-   ```pwsh
-   # Windows (PowerShell)
-   $SkillScripts = "$HOME\.gemini\config\skills\improve-agent-efficiency\scripts"
-   py -3.10 "$SkillScripts\audit_trajectories.py" (Get-Location).Path --inventory-only
-   ```
-
+   When invoked without scope arguments, run `--inventory-only`:
    ```bash
-   # macOS / Linux (POSIX)
-   SkillScripts="$HOME/.gemini/config/skills/improve-agent-efficiency/scripts"
-   python3 "$SkillScripts/audit_trajectories.py" "$(pwd)" --inventory-only
+   python3 "<SkillDir>/scripts/audit_trajectories.py" "<ScratchDir>" --inventory-only
    ```
-
-3. **Interactive Scoping Modal (`ask_question`):**
-   Read `trajectory_inventory.json` and call `ask_question` with discovered options pre-populated:
+   Read `<ScratchDir>/trajectory_inventory.json` and call `ask_question` with discovered options:
    - **Repository Scope:**
-     - `(Recommended) Current workspace only (<current_repo>)`
+     - `(Recommended) Current workspace only (<active_workspace>)`
      - `Top active repositories (<top_3_repos>)`
      - `Full system sweep (all repositories)`
    - **Time Window:**
@@ -110,146 +77,67 @@ The workflow operates across six distinct phases:
 
 ### Phase 1: Execute Host Probe and Trajectory Mining
 
-Execute both diagnostic tools using the scoped arguments:
-
-```pwsh
-# Windows (PowerShell)
-$SkillScripts = "$HOME\.gemini\config\skills\improve-agent-efficiency\scripts"
-py -3.10 "$SkillScripts\probe_environment.py" (Get-Location).Path
-py -3.10 "$SkillScripts\audit_trajectories.py" (Get-Location).Path --since <YYYY-MM-DD> --repo <target_repo>
-```
+Run both [`scripts/probe_environment.py`](scripts/probe_environment.py) and [`scripts/audit_trajectories.py`](scripts/audit_trajectories.py) targeting `<ScratchDir>`:
 
 ```bash
 # macOS / Linux (POSIX)
-SkillScripts="$HOME/.gemini/config/skills/improve-agent-efficiency/scripts"
-python3 "$SkillScripts/probe_environment.py" "$(pwd)"
-python3 "$SkillScripts/audit_trajectories.py" "$(pwd)" --since <YYYY-MM-DD> --repo <target_repo>
+python3 "<SkillDir>/scripts/probe_environment.py" "<ScratchDir>"
+python3 "<SkillDir>/scripts/audit_trajectories.py" "<ScratchDir>" --since <YYYY-MM-DD> --repo <target_repo>
 ```
 
-#### Supported Mining Flags
-- `--since YYYY-MM-DD`: Restrict audit to sessions on or after a specific date. Useful for measuring the impact of recent rule updates.
-- `--until YYYY-MM-DD`: Restrict audit to sessions on or before a specific date/timestamp to freeze the evaluation window.
-- `--compare`: Compare the target time window against baseline history, outputting side-by-side deltas for failure rate, friction loops, token burn per turn/session, and unbounded file view ratios.
-- `--repo <keyword>`: Restrict audit to sessions associated with a specific repository name.
-- `--exclude <name1,name2>`: Exclude specific repositories from the audit.
-- `--exclude-conv <id1,id2>`: Exclude specific conversation IDs from the audit.
-- `--include-audit-sessions`: Include self and audit/meta-evaluation sessions (default: automatically excluded).
-- `--all`: Parse all discovered sessions without conversation count limits.
-- `--limit <N>`: Maximum recent conversations to evaluate (default: 100).
-- `--inventory-only`: Rapid repository inventory scan without parsing transcripts (<2 seconds).
-- `--print-summary`: Print structured JSON summary payload directly to stdout after audit completion for programmatic piping without intermediate disk inspection.
+```pwsh
+# Windows (PowerShell)
+py -3.10 "<SkillDir>\scripts\probe_environment.py" "<ScratchDir>"
+py -3.10 "<SkillDir>\scripts\audit_trajectories.py" "<ScratchDir>" --since <YYYY-MM-DD> --repo <target_repo>
+```
 
-The diagnostic run produces two artifacts in the working directory:
-- `host_environment_probe.json`: Live binary inventory, stdout encoding status, and rule discrepancies.
-- `trajectory_audit_summary.json`: Command failure counts, token burn estimations, repository distribution, and extracted incident chains.
-
-#### Structure & Schema of `trajectory_audit_summary.json`
-
-When `--compare` is active, the JSON root provides:
-- `comparison.target_window`: Cohort metrics post `--since` date.
-- `comparison.baseline_window` (and alias `comparison.baseline`): Cohort metrics prior to `--since` date.
-- `comparison.bootstrap_significance_tests`: Conversation-level non-parametric bootstrap results (`unit_of_analysis`, `iterations`, `failure_rate`, `friction_loops`, `median_tokens`, `unmodified_overlap`, `unbounded_views`, `prompt_cache_hit`, `api_context`, `api_input_tokens`).
-
-Each cohort summary object provides:
-- `conversations`: Total active conversations in the window.
-- `user_turns`: Total user prompts.
-- `turns_per_conv`: Mean turns per conversation.
-- `commands`: Total CLI commands executed.
-- `cmds_per_turn`: Commands normalized per turn.
-- `failures`: Non-benign command failure count.
-- `failure_rate_pct`: True command failure percentage.
-- `friction_per_100_cmds`: High-friction incident rate per 100 commands.
-- `inline_per_100_cmds`: Inline `py -c` / `node -e` rate per 100 commands.
-- `py_c_multiline`: `{ "total": N, "failed": N, "fail_pct": Float }` (multi-line scripts with `\n` or `\r`).
-- `py_c_oneline`: `{ "total": N, "failed": N, "fail_pct": Float }` (clean one-line scripts without line breaks).
-- `inline_failures_by_class`: `{ "missing_dependency": N, "syntax_shell_parse": N, "runtime_exception": N, "assertion_or_logic": N, "other_failure": N }`.
-- `missing_dependency_details`: `{ "by_repo": { "<repo>": N }, "by_conv": { "<conv_id>": N } }`.
-- `write_to_file_modes`: `{ "overwrite": N, "create": N, "append": N }` (tool payload dispatch modes).
-- `unbounded_views`: Total unbounded `view_file` calls.
-- `unbounded_view_pct`: Percentage of file views that were unbounded.
-- `file_view_overlap`:
-  - `total_unmodified_lines`, `unique_unmodified_lines`, `unmodified_overlap_pct`: Re-reading lines of unmodified files (true redundant reading friction).
-  - `total_gross_lines`, `unique_gross_lines`, `gross_overlap_pct`: Total session line union including post-edit verifications.
-- `total_tokens`: Total tokens across all categories.
-- `prompt_tokens`: Tokens from user prompts.
-- `response_tokens`: Total response tokens generated by the model (`visible_prose_tokens` + `tool_call_args_tokens`).
-- `response_breakdown`:
-  - `visible_prose_tokens`: Assistant markdown prose.
-  - `tool_call_args_tokens`: Tool call arguments (file write payloads, edits, commands).
-  - `tool_call_args_by_tool`: Map of argument tokens per tool (`write_to_file`, `replace_file_content`, `run_command`, `view_file`, etc.).
-  - `thinking_tokens`: Model chain-of-thought tokens.
-- `tool_tokens`: Total tool output tokens returned to the model.
-- `tool_breakdown`:
-  - `unbounded_view_tokens`: File view outputs without start/end lines.
-  - `bounded_view_tokens`: File view outputs with line slicing.
-  - `run_command_tokens`: Command stdout/stderr outputs.
-  - `other_tool_tokens`: Outputs from specialized tools (MCP, subagents, etc.).
-- `system_tokens`: Total system / ephemeral injected tokens.
-- `system_breakdown`:
-  - `skills_notice_tokens`: `[ACTIVE SKILLS LOADED: ...]` injections.
-  - `memory_recall_tokens`: `[MCP MEMORY RECALL: ...]` injections.
-  - `system_message_tokens`: `<SYSTEM_MESSAGE>` injections.
-  - `other_ephemeral_tokens`: Other runtime notifications.
-- `skills_notice_stats`: `{ "total_injections": N, "injections_per_conv": Float, "injections_per_turn": Float, "total_tokens": N, "persistence_model": "per_turn_ephemeral", "retained_in_history": False }`.
-- `api_tokens_ground_truth`:
-  - `has_ground_truth`: Boolean indicating if native API token metrics were recorded.
-  - `input_tokens_fresh`: Uncached input tokens.
-  - `cache_read_tokens`: Prompt cache read tokens.
-  - `output_tokens_model`: Model output tokens.
-  - `fresh_input_per_conv`, `cache_read_per_conv`, `total_api_per_conv`: Per-session API context volume.
-  - `cache_hit_rate_pct`: Context cache hit ratio (`cache_read / (input + cache_read) * 100`).
-  - `calibration`:
-    - `output_token_ratio_api_vs_est`: Aggregate API output vs estimated response ratio.
-    - `context_magnification_factor`: Cumulative context processed vs unique tokens.
-    - `spread_by_conversation`: `{ "mean": Float, "median": Float, "p25": Float, "p75": Float, "min": Float, "max": Float }`.
-- `tokens_per_conv`, `median_tokens_per_conv`, `p90_tokens_per_conv`: Per-session token distribution.
-- `tokens_per_turn`: Ratio of total tokens to user turns (task granularity indicator).
-- `high_friction_incidents`: Detailed list of multi-step retry chains.
+#### Supported Mining Flags (`audit_trajectories.py`)
+- `--since YYYY-MM-DD` / `--until YYYY-MM-DD`: Bound the evaluation time window.
+- `--compare`: Compare target window (`>= --since`) against baseline (`< --since`) with 1,000-iteration conversation-level bootstrap tests.
+- `--repo <keyword>` / `--exclude <name1,name2>` / `--exclude-conv <id1,id2>`: Filter by repository or conversation ID (applied before `--limit`).
+- `--limit <N>` (default `100`) / `--all`: Cap evaluated conversations after repo filtering, or parse all sessions.
+- `--include-audit-sessions`: Include meta/audit sessions (excluded by default).
+- `--inventory-only`: Fast repository and date boundary discovery without parsing full transcripts.
+- `--print-summary`: Stream structured JSON summary to stdout.
 
 ### Phase 2: Review Diagnostic Outputs
 
-Read both generated JSON artifacts using bounded file reading:
+Inspect `<ScratchDir>/host_environment_probe.json` and `<ScratchDir>/trajectory_audit_summary.json` (see [`references/metrics_and_schema.md`](references/metrics_and_schema.md) for field definitions):
 
-1. **Inspect Host Findings:**
-   Check `host_environment_probe.json` for missing standard tools (`rg`, `gh`, `dotnet`, runtimes) and encoding errors. Flag any tools that are installed on the system but prohibited or declared absent in `GEMINI.md`.
-
-2. **Inspect High-Friction Incident Chains:**
-   Review `high_friction_incidents` in `trajectory_audit_summary.json`. Focus on incidents exhibiting:
-   - `retry_count >= 1`: Multi-step trial-and-error attempts before finding a working command.
-   - `resolved: false`: Unhandled command failures that blocked completion.
-   - `intervening_file_writes`: Cases where the agent had to write a disk script to bypass shell quoting issues.
+1. **Host & Rule Budget Findings (`host_environment_probe.json`):**
+   - Check missing CLI tools (`rg`, `fd`, `jq`, `gh`, `uv`, `pnpm`, `agy`, runtimes) and stream encoding status.
+   - Check `configuration_audit.discrepancies` for false negatives (tools declared missing in `GEMINI.md` that are installed on `PATH`) and rule budget violations (`rule_file_over_24kb_cap` exceeding Antigravity's `24,000`-byte per-file truncation limit or `aggregate_rules_over_token_budget` exceeding the `20,000`-token `defaultRulesBudget`).
+2. **High-Friction Incident Chains (`trajectory_audit_summary.json`):**
+   - Inspect `high_friction_incidents` where `retry_count >= 1`, `resolved: false`, or `intervening_file_writes` is non-empty.
+   - Check `missing_dependency_details.by_repo` and `inline_failures_by_class` to distinguish workspace-local environment gaps from global shell syntax issues.
 
 ### Phase 3: Targeted Forensic Sampling
 
-When an incident category shows recurring friction (such as process file locks, module import errors, or encoding crashes), sample the raw conversation log to understand the full context:
+For recurring incident categories, sample the raw conversation log:
+1. Take `conversation_id` and `initial_step` from the incident entry.
+2. Locate `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl` (fallback to `transcript.jsonl` only if `transcript_full.jsonl` is absent).
+3. Use bounded `view_file` (`StartLine` / `EndLine` around `initial_step`) to verify the exact command, stderr traceback, and recovery action.
 
-1. Identify the `conversation_id` and `initial_step` from the incident record.
-2. Locate the transcript file at:
-   `<appDataDir>/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl` (prefer `transcript_full.jsonl` whenever available to avoid truncated tool outputs; use `transcript.jsonl` only as a fallback when the full transcript is absent).
-3. Execute bounded file inspection around the failure step index to review the exact error stack and model reasoning.
+### Phase 4: Quad-Layer Remediation Deployment
 
-### Phase 4: Tri-Layer Remediation Deployment
+Consult [`references/remediation_patterns.md`](references/remediation_patterns.md) and apply fixes starting from the lowest-token layer:
 
-Apply corrective measures categorized across three distinct layers:
-
-1. **Host Tooling Layer (Zero Token Overhead):**
-   - Install missing CLI utilities requested by agents using native package managers (`winget install --id <Id>`, `brew install <pkg>`).
-   - Set persistent environment variables for terminal streams (e.g., `[Environment]::SetEnvironmentVariable("PYTHONIOENCODING", "utf-8", "User")`).
-
-2. **Global Rules Layer (`~/.gemini/config/GEMINI.md`):**
-   - Correct false statements regarding installed platform binaries.
-   - Enforce the File-First Execution SOP for multi-line logic (`py -c`, `node -e`).
-   - Enforce bounded reading and bounded command output limits.
-
-3. **Workspace Rules Layer (`<repo_root>/AGENTS.md`):**
-   - Reference [references/remediation_patterns.md](references/remediation_patterns.md) for language-specific templates.
-   - Codify runtime pinning (`python`), explicit `PYTHONPATH` exports, solution file targets (`.slnx`), pre-build process termination, and test invocation commands.
+1. **Layer 1 — Host Tooling & Antigravity 2.0 Settings (Zero Token Cost):**
+   - Install missing CLI binaries requested by agents (`brew install <pkg>`, `winget install --id <Id>`).
+   - Set persistent UTF-8 stream variables (`PYTHONIOENCODING=utf-8`).
+   - Recommend Antigravity 2.0 Settings (Command Allowlist/Denylist, Sandbox Mode, Permission Grants) where appropriate.
+2. **Layer 2 — Deterministic Lifecycle Hooks (`hooks.json` — Zero Token Cost):**
+   - Use `PreToolUse` (`matcher: "run_command"`) to deterministically deny (`"decision": "deny"`) or rewrite (`"overwrite": {...}`) recurring command mistakes (such as multi-line `python -c` or wrong package managers).
+   - Use `PostToolUse` (`matcher: "replace_file_content|write_to_file"`) for automatic formatting/linting.
+3. **Layer 3 — Global Rules (`~/.gemini/config/GEMINI.md` & `AGENTS.md`):**
+   - Fix false binary claims, enforce the File-First Execution SOP, and verify that every rule file stays strictly under **`24,000` bytes** and total always-on rules remain under **`20,000` tokens**.
+4. **Layer 4 — Workspace Customizations (`<repo_root>/AGENTS.md` & `.agents/`):**
+   - Codify repo-specific runtime pinning (`uv run`, `pnpm`), `PYTHONPATH`, build/test commands, pre-build process cleanup, and `.agents/skills.json` or `.agents/hooks.json` using the templates in [`references/remediation_patterns.md`](references/remediation_patterns.md).
 
 ### Phase 5: Verification Gate
 
-Validate all applied changes before concluding the task:
-
-1. For host tool installations: Run `<binary> --version` to verify exit code 0.
-2. For environment variables: Run a test command verifying the variable is active in child processes.
-3. For workspace rules: Verify test runner commands and build commands execute cleanly against the target repository.
-4. Format findings, incident comparisons, and verified actions into a final Markdown artifact for user review.
+Verify every applied change before finishing the turn:
+1. **Host Binaries:** Run `<binary> --version` and confirm exit code `0`.
+2. **Rule Budgets & Hooks:** Re-run `probe_environment.py "<ScratchDir>"` to confirm `discrepancies` is empty and all rule files are `< 24,000` bytes.
+3. **Workspace Commands:** Execute the target repository's test/lint commands to confirm zero regression.
+4. **Report:** Present the comparative metrics, root-cause incident trace, and verified remediations to the user.

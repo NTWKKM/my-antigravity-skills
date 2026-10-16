@@ -4,19 +4,25 @@ This reference guide details how to translate trajectory failure patterns into a
 
 ---
 
-## 1. The Tri-Layer Remediation Model
+## 1. The Quad-Layer Remediation Model
 
-When auditing agent failures, categorize fixes into three distinct layers:
+When auditing agent failures in Antigravity, prioritize zero-token deterministic layers before spending always-on rule context budget:
 
 ```
-Layer 1: Native Host Tools (Zero Token Cost)
-   └── If transcripts show the model repeatedly invoking missing host binaries (e.g. rg, gh, fd, jq, node, pnpm, uv, go, cargo, dotnet), install them globally rather than forcing prompt workarounds.
+Layer 1: Native Host Tools & Antigravity 2.0 Settings (Zero Token Cost)
+   ├── Install missing host binaries (rg, gh, fd, jq, uv, node, pnpm, go, cargo, dotnet) globally rather than adding prompt workarounds.
+   └── Configure Antigravity 2.0 Settings (Command Allowlist/Denylist, Sandbox Mode, Non-Workspace File Access, Permission Grants).
 
-Layer 2: Global Configuration (~/.gemini/config/GEMINI.md)
-   └── If a failure mode spans all projects (quoting collapse, output limits, bounded reading), enforce it globally.
+Layer 2: Deterministic Lifecycle Hooks (hooks.json — Zero Token Cost)
+   ├── Use PreToolUse (matcher: "run_command") to hard-block ("decision": "deny") or rewrite ("overwrite": {"CommandLine": "..."}) recurring command anti-patterns (e.g., multiline python -c, wrong package manager).
+   └── Use PostToolUse (matcher: "replace_file_content|write_to_file") for automatic formatting/linting instead of spending agent turns.
 
-Layer 3: Workspace Rules (<repo_root>/AGENTS.md)
-   └── If an invariant is project-specific (PYTHONPATH, package manager, solution file, port hygiene, test targets), deploy it locally.
+Layer 3: Global Rules (~/.gemini/config/GEMINI.md & AGENTS.md)
+   ├── Enforce cross-project behavioral invariants (File-First Execution SOP, bounded reading).
+   └── Budget Guardrail: Each rule file is hard-capped at 24,000 bytes (truncated on line boundaries above 24 KB) and all always-on rules share a 20,000-token defaultRulesBudget. Always prune or disclose domain rules before adding new lines.
+
+Layer 4: Workspace Customizations (<repo_root>/AGENTS.md & .agents/)
+   └── Deploy project-specific invariants (PYTHONPATH, package manager, solution file, port hygiene, test targets, .agents/skills.json, .agents/hooks.json) locally.
 ```
 
 ---
@@ -27,7 +33,8 @@ Layer 3: Workspace Rules (<repo_root>/AGENTS.md)
 - **Symptoms:** `SyntaxError: unterminated string literal`, `SyntaxError: '(' was never closed`, `ParserError: Unexpected token`.
 - **Root Cause:** Shell parsing in bash, zsh, or PowerShell strips nested quotes and breaks multi-line logic passed via inline flags (`python -c`, `node -e`, `bash -c`).
 - **Remediation:**
-  - Enforce a strict **File-First Execution SOP** in global rules: logic exceeding one line must be written to `<appDataDir>/brain/<id>/scratch/` as a standalone script file and executed directly.
+  - **Global Rule:** Enforce a strict **File-First Execution SOP**: multi-line logic must be written to `<appDataDir>/brain/<id>/scratch/` as a standalone script file and executed directly.
+  - **Deterministic Hook (`hooks.json`):** Add a `PreToolUse` handler matching `"run_command"` that returns `{"decision": "deny", "reason": "Multi-line python -c / node -e is prohibited; write a script file to scratch/ instead."}` when `CommandLine` contains `python -c` / `node -e` with newline characters.
 
 ### Archetype 2: Console Output Encoding & Stream Traps
 - **Symptoms:** `UnicodeEncodeError: 'charmap' codec can't encode character...`, garbled terminal control sequences.
@@ -40,8 +47,8 @@ Layer 3: Workspace Rules (<repo_root>/AGENTS.md)
 - **Symptoms:** `The term '<binary>' is not recognized`, `command not found: <binary>`.
 - **Root Cause:** Agent prompts or model training bias reach for standard CLI tools not installed in the host system PATH.
 - **Auditor Guidance:**
-  - Do not restrict inspection to hardcoded tool names. The auditor dynamically extracts whatever binary name triggered `not recognized` or `command not found` from the standard error stream.
-  - Typical examples include repository search utilities (`rg`, `fd`), platform clients (`gh`), language runtimes (`uv`, `node`, `pnpm`, `go`, `cargo`, `dotnet`), and data formatters (`jq`).
+  - Dynamically extract whatever binary name triggered `not recognized` or `command not found` from the standard error stream.
+  - Typical examples include repository search utilities (`rg`, `fd`), platform clients (`gh`, `agy`), language runtimes (`uv`, `node`, `pnpm`, `go`, `cargo`, `dotnet`), and data formatters (`jq`).
 - **Remediation:**
   - Windows: `winget install --id <PackageId> --exact`
   - macOS: `brew install <package>`
@@ -66,11 +73,14 @@ Layer 3: Workspace Rules (<repo_root>/AGENTS.md)
 - **Remediation:**
   - Codify interpreter prefixes in rules (e.g. `bash ./script.sh` or explicit `chmod +x` prior to invocation).
 
-### Archetype 7: Working Directory & Monorepo Path Misalignments
-- **Symptoms:** `fatal: not a git repository`, `ENOENT: no such file or directory`, `collected 0 items`.
-- **Root Cause:** Commands targeting project manifests (such as `package.json`, `Cargo.toml`, or `pyproject.toml`) or tests executed from the repository root instead of the relevant package subdirectory.
+### Archetype 8: Context Magnification & Token Cost Inefficiency
+- **Symptoms:** High token burn across long conversations, slow response latency, context reaching P90 (>240k tokens).
+- **Root Cause:** In multi-turn agent loops (median ~84 API calls), prompt context is re-processed on every turn, causing a ~90x cumulative context magnification factor. Context input represents **~92.8% – 94.5% of total dollar cost**, while tool call arguments represent **~48.3% of model output tokens**. Visible chat prose is <0.4% of cost.
 - **Remediation:**
-  - Specify explicit working directory requirements in `<repo_root>/AGENTS.md` (e.g., prescribing that test runners or build commands execute with explicit `Cwd` targeting the subfolder).
+  - **Surgical Diff Tooling (Layer 2/3):** Enforce `replace_file_content` over whole-file `write_to_file`. Replacing a 10-line block consumes ~50 tokens in tool arguments, whereas rewriting an 800-line file consumes ~4,000 output tokens.
+  - **Bounded File Views (Layer 3):** Always use `view_file` with explicit `StartLine` and `EndLine` parameters (or grep/find first) to prevent injecting megabytes of source files into conversation context history.
+  - **Proactive Compaction Gate (Layer 3):** Trigger `/compact` or summarize history when conversation reaches ~20 turns or context approaches P90 (~240k tokens), before the 90x magnification factor multiplies the accumulated context across remaining turns.
+  - **Prefix Cache Stability (Layer 3/4):** Keep invariant rules, skills, and system instructions in stable prefixes so the prompt cache achieves $\ge 93\%$ cache hit rates ($0.25\times$ pricing discount).
 
 ---
 

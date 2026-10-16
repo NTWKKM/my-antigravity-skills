@@ -190,6 +190,7 @@ def discover_ide_workspaces(ws_storage_dir):
 def discover_git_repositories(ide_workspaces, base_dir):
     repos = {}
     search_dirs = [
+        Path.home(),
         Path.home() / "Documents" / "repos",
         Path.home() / "Documents" / "Projects",
         Path.home() / "Projects",
@@ -200,18 +201,27 @@ def discover_git_repositories(ide_workspaces, base_dir):
         Path.home() / "workspace",
         Path.home() / "workspaces",
         Path.home() / "Documents",
+        Path.home() / "Desktop",
         base_dir / "scratch",
     ]
 
+    cwd_git = find_git_root(os.getcwd())
+    if cwd_git:
+        repos[norm_path(cwd_git)] = cwd_git
+
     for sd in search_dirs:
         if sd.exists():
-            if (sd / ".git").exists():
+            if sd != Path.home() and (sd / ".git").exists():
                 np = norm_path(str(sd))
                 repos[np] = str(sd.resolve())
             else:
                 try:
                     for child in sd.iterdir():
-                        if child.is_dir() and (child / ".git").exists():
+                        if (
+                            child.is_dir()
+                            and not child.name.startswith(".")
+                            and (child / ".git").exists()
+                        ):
                             np = norm_path(str(child))
                             repos[np] = str(child.resolve())
                 except Exception:
@@ -429,7 +439,7 @@ def classify_failure(cmd, response_snippet, exit_code, inline_failure_class=None
 def parse_conversations(
     brain_dirs,
     candidate_repos,
-    max_conversations=50,
+    max_conversations=None,
     since_dt=None,
     until_dt=None,
     target_repo=None,
@@ -474,9 +484,12 @@ def parse_conversations(
             # Determine true conversation start time and prompt preview from user prompt
             start_dt = None
             first_step_text = ""
+            is_audit_session = False
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
+                    for line_idx, line in enumerate(f):
+                        if not auto_exclude_audit and line_idx > 25:
+                            break
                         line_str = line.strip()
                         if not line_str:
                             continue
@@ -491,9 +504,51 @@ def parse_conversations(
                                 )
                         st = d0.get("type", "")
                         source = d0.get("source", "")
-                        if st == "USER_INPUT" or source == "USER_EXPLICIT":
-                            first_step_text = d0.get("content", "") or ""
-                            break
+                        c_text = d0.get("content", "") or ""
+
+                        if (
+                            st == "USER_INPUT" or source == "USER_EXPLICIT"
+                        ) and not first_step_text:
+                            first_step_text = c_text if isinstance(c_text, str) else ""
+
+                        if auto_exclude_audit and not is_audit_session:
+                            # 1. Action evidence from user skill or audit request invocation
+                            if (
+                                st == "USER_INPUT" or source == "USER_EXPLICIT"
+                            ) and isinstance(c_text, str):
+                                c_low = c_text.lower()
+                                if (
+                                    "/improve-agent-efficiency" in c_low
+                                    or '<skill>the user requested you read and use the "improve-agent-efficiency"'
+                                    in c_low
+                                    or "antigravity token usage analysis" in c_low
+                                ):
+                                    is_audit_session = True
+                                    break
+
+                            # 2. Action evidence from executed audit commands
+                            for tc in d0.get("tool_calls", []) or []:
+                                if tc.get("name") == "run_command":
+                                    tc_args = (
+                                        tc.get("args") or tc.get("arguments") or {}
+                                    )
+                                    if not isinstance(tc_args, dict):
+                                        continue
+                                    cmd = (tc_args.get("CommandLine") or "").lower()
+                                    if any(
+                                        s in cmd
+                                        for s in [
+                                            "audit_trajectories.py",
+                                            "probe_environment.py",
+                                            "analyze_token_landmarks.py",
+                                            "bootstrap_landmarks.py",
+                                            "detect_eras_and_landmarks.py",
+                                        ]
+                                    ):
+                                        is_audit_session = True
+                                        break
+                            if is_audit_session:
+                                break
             except Exception:
                 pass
 
@@ -503,20 +558,9 @@ def parse_conversations(
                 except Exception:
                     continue
 
-            # Auto-exclude audit sessions (current active session or sessions executing trajectory audit)
-            if auto_exclude_audit:
-                if item.name == "9594bcbb-d8fb-4482-bb7d-3e80af28a13e":
-                    continue
-                if any(
-                    k in first_step_text
-                    for k in [
-                        "audit_trajectories.py",
-                        "/improve-agent-efficiency",
-                        "improve-agent-efficiency",
-                        "efficiency status และ token burn",
-                    ]
-                ):
-                    continue
+            # Auto-exclude audit sessions identified strictly by action evidence
+            if auto_exclude_audit and is_audit_session:
+                continue
 
             if until_dt and start_dt > until_dt:
                 continue
@@ -529,10 +573,23 @@ def parse_conversations(
 
     conv_candidates.sort(key=lambda x: x[0], reverse=True)
     total_candidates = len(conv_candidates)
-    if max_conversations and max_conversations > 0:
-        conv_candidates = conv_candidates[:max_conversations]
+    target_count = 0
+    baseline_count = 0
 
     for mtime, item, tpath, conv_dt in conv_candidates:
+        if max_conversations and max_conversations > 0:
+            if compare_mode and since_dt:
+                if (
+                    target_count >= max_conversations
+                    and baseline_count >= max_conversations
+                ):
+                    break
+                if conv_dt >= since_dt and target_count >= max_conversations:
+                    continue
+                if conv_dt < since_dt and baseline_count >= max_conversations:
+                    continue
+            elif len(conversations) >= max_conversations:
+                break
         first_prompt = ""
         user_prompts = []
         active_ws = ""
@@ -611,7 +668,9 @@ def parse_conversations(
                     tname_item = tc_item.get("name") or "other"
                     targs = tc_item.get("args") or {}
                     targs_str = (
-                        json.dumps(targs) if isinstance(targs, dict) else str(targs)
+                        json.dumps(targs, ensure_ascii=False)
+                        if isinstance(targs, dict)
+                        else str(targs)
                     )
                     planner_tool_args_chars += len(targs_str)
                     tool_args_chars_by_tool[tname_item] += len(targs_str)
@@ -636,13 +695,69 @@ def parse_conversations(
                 total_tool_output_chars += len(content)
 
             if "<user_information>" in content:
+                in_active_ws_block = False
+                fallback_cwd = ""
                 for line in content.split("\n"):
-                    if "active workspace is" in line.lower():
-                        cand = line.split("active workspace is")[-1].strip().rstrip(".")
-                        if cand:
+                    s_line = line.strip()
+                    low_line = s_line.lower()
+                    ws_marker = "active workspace is"
+                    ws_idx = low_line.find(ws_marker)
+                    if ws_idx != -1:
+                        cand = s_line[ws_idx + len(ws_marker) :].strip().rstrip(".")
+                        if cand and not active_ws:
                             active_ws = norm_path(cand)
+                    elif low_line.startswith("active workspaces:"):
+                        in_active_ws_block = True
+                    elif in_active_ws_block and s_line.startswith("- "):
+                        cand = s_line[2:].strip()
+                        if cand and not active_ws:
+                            active_ws = norm_path(cand)
+                    elif low_line.startswith("command working directory:"):
+                        in_active_ws_block = False
+                        cand = s_line.split(":", 1)[-1].strip()
+                        if cand and not fallback_cwd:
+                            fallback_cwd = norm_path(cand)
+                    elif in_active_ws_block:
+                        in_active_ws_block = False
+
+                if not active_ws and fallback_cwd:
+                    active_ws = fallback_cwd
+
+                if active_ws:
+                    git_root = find_git_root(active_ws)
+                    if git_root:
+                        gn = norm_path(git_root)
+                        if gn not in candidate_repos:
+                            candidate_repos[gn] = git_root
+                            sorted_repo_norms = sorted(
+                                list(candidate_repos.keys()),
+                                key=lambda x: len(x),
+                                reverse=True,
+                            )
 
             tc_list = step.get("tool_calls", [])
+            # Collect subsequent non-ephemeral tool result steps up to next planner/user boundary
+            tool_result_steps = []
+            if tc_list:
+                for j in range(i + 1, len(steps)):
+                    sj = steps[j]
+                    st_j = sj.get("type", "")
+                    src_j = sj.get("source", "")
+                    if (
+                        st_j in ["PLANNER_RESPONSE", "USER_INPUT"]
+                        or src_j == "USER_EXPLICIT"
+                    ):
+                        break
+                    if st_j in [
+                        "EPHEMERAL_MESSAGE",
+                        "SYSTEM_MESSAGE",
+                        "CHECKPOINT",
+                        "CONVERSATION_HISTORY",
+                    ] or src_j in ["SYSTEM_SDK", "SYSTEM"]:
+                        continue
+                    tool_result_steps.append(sj)
+
+            used_cmd_step_ids = set()
             for tc_idx, tc in enumerate(tc_list):
                 tname = tc.get("name")
                 args = tc.get("args") or tc.get("arguments") or {}
@@ -702,9 +817,8 @@ def parse_conversations(
                     e_line = args.get("EndLine")
                     is_bounded = s_line is not None and e_line is not None
                     v_len = 0
-                    t_idx = i + tc_idx + 1
-                    if t_idx < len(steps):
-                        v_len = len(steps[t_idx].get("content", "") or "")
+                    if tc_idx < len(tool_result_steps):
+                        v_len = len(tool_result_steps[tc_idx].get("content", "") or "")
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
@@ -723,12 +837,23 @@ def parse_conversations(
                 elif tname == "run_command":
                     exit_code = None
                     resp_content = ""
-                    for j in range(i + tc_idx + 1, min(i + tc_idx + 4, len(steps))):
-                        m_content = steps[j].get("content", "")
+                    # Prefer matching positional tool_result_steps[tc_idx] first, then scan all tool_result_steps
+                    candidate_steps = []
+                    if tc_idx < len(tool_result_steps):
+                        candidate_steps.append((tc_idx, tool_result_steps[tc_idx]))
+                    for r_idx, r_step in enumerate(tool_result_steps):
+                        if r_idx != tc_idx:
+                            candidate_steps.append((r_idx, r_step))
+
+                    for r_idx, r_step in candidate_steps:
+                        if r_idx in used_cmd_step_ids:
+                            continue
+                        m_content = r_step.get("content", "") or ""
                         if (
                             "exited with code" in m_content
                             or "finished with result:" in m_content
                         ):
+                            used_cmd_step_ids.add(r_idx)
                             resp_content = m_content
                             m = re.search(r"exited with code (-?\d+)", m_content)
                             if m:
@@ -1005,6 +1130,11 @@ def parse_conversations(
                 "bounded_views": file_views_bounded,
             }
         )
+        if compare_mode and since_dt:
+            if conv_dt >= since_dt:
+                target_count += 1
+            else:
+                baseline_count += 1
 
     return conversations, total_candidates
 
@@ -1173,11 +1303,16 @@ def calculate_cohort_summary(conv_list):
     has_api_gt = num_api_convs > 0 and (
         total_api_input_tok > 0 or total_api_cache_read_tok > 0
     )
-    total_api_context_all = (
-        total_api_input_tok + total_api_cache_read_tok + total_api_output_tok
-    )
+    total_api_context_processed = total_api_input_tok + total_api_cache_read_tok
+    total_api_tokens_all = total_api_context_processed + total_api_output_tok
+
     api_context_per_conv = (
-        round(total_api_context_all / num_api_convs)
+        round(total_api_context_processed / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
+        else None
+    )
+    api_total_tokens_per_conv = (
+        round(total_api_tokens_all / num_api_convs)
         if num_api_convs > 0 and has_api_gt
         else None
     )
@@ -1206,15 +1341,20 @@ def calculate_cohort_summary(conv_list):
         if has_api_gt and (total_api_input_tok + total_api_cache_read_tok) > 0
         else None
     )
-    est_output_tokens = total_prose_tok + total_tool_args_tok + total_think_tok
+    api_est_output_tokens = sum(
+        (c.get("prose_tokens", 0) or 0)
+        + (c.get("tool_args_tokens", 0) or 0)
+        + (c.get("thinking_tokens", 0) or 0)
+        for c in api_convs
+    )
     calib_ratio = (
-        round(total_api_output_tok / est_output_tokens, 2)
-        if has_api_gt and est_output_tokens > 0
+        round(total_api_output_tok / api_est_output_tokens, 2)
+        if has_api_gt and api_est_output_tokens > 0
         else None
     )
     api_conv_tokens = sum(c["total_tokens"] for c in api_convs)
     cxt_mag_factor = (
-        round(total_api_context_all / api_conv_tokens, 1)
+        round(total_api_context_processed / api_conv_tokens, 1)
         if has_api_gt and api_conv_tokens > 0
         else None
     )
@@ -1355,13 +1495,15 @@ def calculate_cohort_summary(conv_list):
             "input_tokens_fresh": total_api_input_tok if has_api_gt else None,
             "cache_read_tokens": total_api_cache_read_tok if has_api_gt else None,
             "output_tokens_model": total_api_output_tok if has_api_gt else None,
-            "total_api_context_processed": total_api_context_all
+            "total_api_context_processed": total_api_context_processed
             if has_api_gt
             else None,
+            "total_api_tokens_all": total_api_tokens_all if has_api_gt else None,
             "fresh_input_per_conv": api_fresh_per_conv,
             "cache_read_per_conv": api_cache_read_per_conv,
             "output_per_conv": api_output_per_conv,
-            "total_api_per_conv": api_context_per_conv,
+            "context_per_conv": api_context_per_conv,
+            "total_api_per_conv": api_total_tokens_per_conv,
             "cache_hit_rate_pct": cache_hit_rate,
             "calibration": {
                 "output_token_ratio_api_vs_est": calib_ratio,
@@ -1426,29 +1568,6 @@ def bootstrap_conversation_diff(
     return low, high, p_val, is_significant
 
 
-def is_statistically_significant(c_events, c_total, b_events, b_total, min_samples=30):
-    if c_events is None or b_events is None or c_total is None or b_total is None:
-        return False
-    if c_total < min_samples or b_total < min_samples:
-        return False
-    if c_total <= 0 or b_total <= 0:
-        return False
-    p1 = c_events / c_total
-    p2 = b_events / b_total
-    p_pool = (c_events + b_events) / (c_total + b_total)
-    if p_pool <= 0 or p_pool >= 1:
-        return False
-    smaller_total = min(c_total, b_total)
-    min_expected_cell = smaller_total * min(p_pool, 1.0 - p_pool)
-    if min_expected_cell < 5:
-        return False
-    se = (p_pool * (1 - p_pool) * (1 / c_total + 1 / b_total)) ** 0.5
-    if se == 0:
-        return False
-    z = abs(p1 - p2) / se
-    return z >= 1.96
-
-
 def format_delta(
     current,
     baseline,
@@ -1505,14 +1624,32 @@ def run_inventory(output_dir=None):
                 or item.name in seen_ids
             ):
                 continue
-            tpath = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath_full = item / ".system_generated" / "logs" / "transcript_full.jsonl"
+            tpath_compact = item / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath = tpath_full if tpath_full.exists() else tpath_compact
             if not tpath.exists():
                 continue
             seen_ids.add(item.name)
             total_convs += 1
             try:
-                mtime = os.path.getmtime(tpath)
-                dt = datetime.fromtimestamp(mtime)
+                dt = None
+                with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        d0 = json.loads(line_str)
+                        c_str = d0.get("created_at")
+                        if c_str:
+                            dt = (
+                                datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                                .astimezone()
+                                .replace(tzinfo=None)
+                            )
+                        break
+                if dt is None:
+                    mtime = os.path.getmtime(tpath)
+                    dt = datetime.fromtimestamp(mtime)
                 if earliest_dt is None or dt < earliest_dt:
                     earliest_dt = dt
                 if latest_dt is None or dt > latest_dt:
@@ -1681,6 +1818,9 @@ def run_audit(
         # Partition conversations by start timestamp
         target_convs = [c for c in all_convs if c["dt"] >= since_dt]
         baseline_convs = [c for c in all_convs if c["dt"] < since_dt]
+        if max_conversations and max_conversations > 0:
+            target_convs = target_convs[:max_conversations]
+            baseline_convs = baseline_convs[:max_conversations]
 
         target_summary = calculate_cohort_summary(target_convs)
         baseline_summary = calculate_cohort_summary(baseline_convs)
@@ -1821,16 +1961,14 @@ def run_audit(
             for c in b_api_convs
         ]
 
-        t_api_totals = [
+        t_api_context = [
             (c.get("api_input_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
-            + (c.get("api_output_tokens", 0) or 0)
             for c in t_api_convs
         ]
-        b_api_totals = [
+        b_api_context = [
             (c.get("api_input_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
-            + (c.get("api_output_tokens", 0) or 0)
             for c in b_api_convs
         ]
 
@@ -1856,8 +1994,8 @@ def run_audit(
         _, _, p_cache, sig_cache = bootstrap_conversation_diff(
             t_cache_pairs, b_cache_pairs, stat_fn=pooled_ratio_stat
         )
-        _, _, p_api_conv, sig_api_conv = bootstrap_conversation_diff(
-            t_api_totals, b_api_totals
+        _, _, p_api_context, sig_api_context = bootstrap_conversation_diff(
+            t_api_context, b_api_context
         )
         _, _, p_api_fresh, sig_api_fresh = bootstrap_conversation_diff(
             t_api_fresh, b_api_fresh
@@ -1980,10 +2118,10 @@ def run_audit(
         )
         print_row(
             "API Context / Conv (Ground Truth)",
-            base_api.get("total_api_per_conv"),
-            tgt_api.get("total_api_per_conv"),
+            base_api.get("context_per_conv") or base_api.get("total_api_per_conv"),
+            tgt_api.get("context_per_conv") or tgt_api.get("total_api_per_conv"),
             lower_is_better=True,
-            is_significant=sig_api_conv,
+            is_significant=sig_api_context,
         )
         print_row(
             "API Fresh Input / Conv",
@@ -2061,8 +2199,8 @@ def run_audit(
                         "significant": sig_cache,
                     },
                     "api_context": {
-                        "p_value": round(p_api_conv, 4),
-                        "significant": sig_api_conv,
+                        "p_value": round(p_api_context, 4),
+                        "significant": sig_api_context,
                     },
                     "api_input_tokens": {
                         "p_value": round(p_api_fresh, 4),
