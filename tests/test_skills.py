@@ -614,6 +614,42 @@ class TestAuditTrajectories(unittest.TestCase):
             self.assertEqual(len(convs), 1)
             self.assertEqual(convs[0]["repo_path"], str(ws_dir))
 
+    def test_command_working_directory_attributed_when_active_workspaces_empty(self):
+        """When 'Active Workspaces:' is present but empty, 'Command Working Directory:' should be attributed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cwd_dir = tmp_path / "scratch-cwd"
+            (cwd_dir / ".git").mkdir(parents=True)
+
+            brain_dir = tmp_path / "brain"
+            c_dir = brain_dir / "conv-empty-ws-test" / ".system_generated" / "logs"
+            c_dir.mkdir(parents=True)
+            content = (
+                "<user_information>\n"
+                "The USER's OS version is mac.\n"
+                "Active Workspaces:\n"
+                f"Command Working Directory: {cwd_dir}\n"
+                "</user_information>\n"
+            )
+            step = {
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": "2026-04-01T10:00:00Z",
+                "content": content,
+            }
+            (c_dir / "transcript.jsonl").write_text(
+                json.dumps(step) + "\n", encoding="utf-8"
+            )
+
+            norm_cwd = audit_trajectories.norm_path(str(cwd_dir))
+            candidate_repos = {norm_cwd: str(cwd_dir)}
+
+            convs, _ = audit_trajectories.parse_conversations(
+                [brain_dir], candidate_repos, max_conversations=10
+            )
+            self.assertEqual(len(convs), 1)
+            self.assertEqual(convs[0]["repo_path"], str(cwd_dir))
+
 
 class TestProbeEnvironment(unittest.TestCase):
     def test_probe_python_environment_does_not_pollute_stdout(self):

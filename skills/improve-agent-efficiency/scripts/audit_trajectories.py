@@ -708,17 +708,17 @@ def parse_conversations(
                             active_ws = norm_path(cand)
                     elif low_line.startswith("active workspaces:"):
                         in_active_ws_block = True
-                    elif in_active_ws_block:
-                        if s_line.startswith("- "):
-                            cand = s_line[2:].strip()
-                            if cand and not active_ws:
-                                active_ws = norm_path(cand)
-                        else:
-                            in_active_ws_block = False
+                    elif in_active_ws_block and s_line.startswith("- "):
+                        cand = s_line[2:].strip()
+                        if cand and not active_ws:
+                            active_ws = norm_path(cand)
                     elif low_line.startswith("command working directory:"):
+                        in_active_ws_block = False
                         cand = s_line.split(":", 1)[-1].strip()
                         if cand and not fallback_cwd:
                             fallback_cwd = norm_path(cand)
+                    elif in_active_ws_block:
+                        in_active_ws_block = False
 
                 if not active_ws and fallback_cwd:
                     active_ws = fallback_cwd
