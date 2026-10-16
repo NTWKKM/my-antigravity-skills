@@ -376,12 +376,28 @@ class TestProbeEnvironment(unittest.TestCase):
         """probe_global_configuration_discrepancies should audit ~/.gemini/GEMINI.md and rules/*.md even if ~/.gemini/config/GEMINI.md is absent."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_home = Path(tmp)
+            with mock.patch.object(Path, "home", return_value=tmp_home):
+                empty_res = probe_environment.probe_global_configuration_discrepancies(
+                    {}
+                )
+                self.assertFalse(empty_res["config_found"])
+                self.assertEqual(empty_res["total_rule_bytes"], 0)
+                self.assertEqual(empty_res["estimated_rule_tokens"], 0)
+
             gemini_dir = tmp_home / ".gemini"
             rules_dir = gemini_dir / "config" / "rules"
             rules_dir.mkdir(parents=True)
-            (gemini_dir / "GEMINI.md").write_text("a" * 400, encoding="utf-8")
-            (rules_dir / "custom.md").write_text("b" * 400, encoding="utf-8")
+            custom_rule = rules_dir / "custom.md"
+            custom_rule.write_text("b" * 400, encoding="utf-8")
 
+            with mock.patch.object(Path, "home", return_value=tmp_home):
+                res_rules_only = (
+                    probe_environment.probe_global_configuration_discrepancies({})
+                )
+                self.assertTrue(res_rules_only["config_found"])
+                self.assertEqual(res_rules_only["config_path"], str(custom_rule))
+
+            (gemini_dir / "GEMINI.md").write_text("a" * 400, encoding="utf-8")
             with mock.patch.object(Path, "home", return_value=tmp_home):
                 res = probe_environment.probe_global_configuration_discrepancies({})
                 self.assertTrue(res["config_found"])
@@ -454,6 +470,18 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
             )
             violations4 = check_repo_safety.check_manifest_integrity(tmp_repo)
             self.assertTrue(any("plugin.json" in v for v in violations4))
+
+    def test_check_repo_safety_copies_are_byte_identical(self):
+        """Root scripts/check_repo_safety.py and packaged skills/public-repo-safety/scripts/check_repo_safety.py must be identical."""
+        root_copy = (REPO_ROOT / "scripts" / "check_repo_safety.py").read_bytes()
+        skill_copy = (
+            REPO_ROOT
+            / "skills"
+            / "public-repo-safety"
+            / "scripts"
+            / "check_repo_safety.py"
+        ).read_bytes()
+        self.assertEqual(root_copy, skill_copy)
 
 
 if __name__ == "__main__":

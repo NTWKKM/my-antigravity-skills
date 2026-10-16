@@ -157,17 +157,22 @@ def probe_global_configuration_discrepancies(binaries):
                 seen_paths.add(resolved)
                 rule_files.append(rf_cand)
 
-    primary_config_path = (
-        gemini_config_path
-        if gemini_config_path.exists()
-        else (root_gemini_path if root_gemini_path.exists() else gemini_config_path)
-    )
+    if gemini_config_path.exists():
+        primary_config_path = gemini_config_path
+    elif root_gemini_path.exists():
+        primary_config_path = root_gemini_path
+    elif rule_files:
+        primary_config_path = rule_files[0]
+    else:
+        primary_config_path = gemini_config_path
 
     if not rule_files:
         return {
             "config_found": False,
             "config_path": str(primary_config_path),
             "hooks_configured": hooks_config_path.exists(),
+            "total_rule_bytes": 0,
+            "estimated_rule_tokens": 0,
             "discrepancies": discrepancies,
         }
 

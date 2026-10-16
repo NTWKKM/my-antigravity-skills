@@ -374,10 +374,11 @@ def parse_yaml_frontmatter(fm_text: str) -> dict:
     if yaml is not None:
         try:
             loaded = yaml.safe_load(fm_text)
-        except Exception as yex:
+        except yaml.YAMLError as yex:
             raise ValueError(f"YAML parse error: {yex}") from yex
         if not isinstance(loaded, dict):
             raise ValueError("YAML frontmatter must parse to a mapping object")
+        return loaded
 
     lines = fm_text.splitlines()
     result: dict = {}
