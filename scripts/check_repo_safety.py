@@ -252,16 +252,96 @@ def check_file_hygiene(repo_root: Path, rel_path: str) -> List[str]:
     return violations
 
 
+_VALID_YAML_SINGLE_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": "\u2028",
+    "P": "\u2029",
+}
+
+
+def _parse_double_quoted_yaml(val: str, raw_val: str) -> str:
+    """Validates and unescapes a YAML 1.2 double-quoted scalar."""
+    if len(val) < 2 or not val.startswith('"') or not val.endswith('"'):
+        raise ValueError(f"Unclosed double-quoted string: {raw_val}")
+    inner = val[1:-1]
+    out: List[str] = []
+    idx = 0
+    length = len(inner)
+    while idx < length:
+        ch = inner[idx]
+        if ch == '"':
+            raise ValueError(f"Unescaped double quote in scalar: {raw_val}")
+        if ch != "\\":
+            out.append(ch)
+            idx += 1
+            continue
+        idx += 1
+        if idx >= length:
+            raise ValueError(f"Trailing backslash in double-quoted string: {raw_val}")
+        esc = inner[idx]
+        if esc in _VALID_YAML_SINGLE_ESCAPES:
+            out.append(_VALID_YAML_SINGLE_ESCAPES[esc])
+            idx += 1
+        elif esc in ("x", "u", "U"):
+            hex_len = 2 if esc == "x" else (4 if esc == "u" else 8)
+            hex_part = inner[idx + 1 : idx + 1 + hex_len]
+            if len(hex_part) != hex_len or not re.fullmatch(r"[0-9A-Fa-f]+", hex_part):
+                raise ValueError(
+                    f"Invalid YAML hex escape '\\{esc}{hex_part}' in: {raw_val}"
+                )
+            out.append(chr(int(hex_part, 16)))
+            idx += 1 + hex_len
+        else:
+            raise ValueError(f"Invalid YAML escape sequence '\\{esc}' in: {raw_val}")
+    return "".join(out)
+
+
+def _parse_single_quoted_yaml(val: str, raw_val: str) -> str:
+    """Validates and unescapes a YAML 1.2 single-quoted scalar."""
+    if len(val) < 2 or not val.startswith("'") or not val.endswith("'"):
+        raise ValueError(f"Unclosed single-quoted string: {raw_val}")
+    inner = val[1:-1]
+    out: List[str] = []
+    idx = 0
+    length = len(inner)
+    while idx < length:
+        ch = inner[idx]
+        if ch == "'":
+            if idx + 1 < length and inner[idx + 1] == "'":
+                out.append("'")
+                idx += 2
+            else:
+                raise ValueError(f"Unescaped single quote in scalar: {raw_val}")
+        else:
+            out.append(ch)
+            idx += 1
+    return "".join(out)
+
+
 def _parse_yaml_scalar(raw_val: str) -> object:
     """Parses a single-line YAML scalar value and validates syntax."""
     val = raw_val.strip()
     if not val:
         return None
-    if val[0] in ('"', "'"):
-        quote = val[0]
-        if len(val) < 2 or not val.endswith(quote):
-            raise ValueError(f"Unclosed quoted string: {raw_val}")
-        return val[1:-1]
+    if val[0] == '"':
+        return _parse_double_quoted_yaml(val, raw_val)
+    if val[0] == "'":
+        return _parse_single_quoted_yaml(val, raw_val)
     if val.startswith("[") or val.startswith("{"):
         if (val.startswith("[") and not val.endswith("]")) or (
             val.startswith("{") and not val.endswith("}")
@@ -286,6 +366,19 @@ def _parse_yaml_scalar(raw_val: str) -> object:
 
 def parse_yaml_frontmatter(fm_text: str) -> dict:
     """Parses YAML frontmatter into a dictionary, rejecting invalid YAML syntax."""
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        yaml = None
+
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(fm_text)
+        except Exception as yex:
+            raise ValueError(f"YAML parse error: {yex}") from yex
+        if not isinstance(loaded, dict):
+            raise ValueError("YAML frontmatter must parse to a mapping object")
+
     lines = fm_text.splitlines()
     result: dict = {}
     i = 0

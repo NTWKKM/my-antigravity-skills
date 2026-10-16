@@ -430,6 +430,16 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
             self.assertTrue(any("Frontmatter 'name'" in v for v in violations2))
             self.assertTrue(any("Frontmatter 'description'" in v for v in violations2))
 
+            # Invalid YAML escape sequences in quoted strings (e.g., "\q") should be rejected
+            (bad_skill / "SKILL.md").write_text(
+                '---\nname: bad-skill\ndescription: "\\q"\n---\n# Invalid Escape\n',
+                encoding="utf-8",
+            )
+            violations_esc = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertTrue(
+                any("Invalid YAML frontmatter" in v for v in violations_esc)
+            )
+
             # Valid block scalar frontmatter should pass
             (bad_skill / "SKILL.md").write_text(
                 "---\nname: bad-skill\ndescription: >-\n  Multi-line valid description.\n---\n# Valid\n",
