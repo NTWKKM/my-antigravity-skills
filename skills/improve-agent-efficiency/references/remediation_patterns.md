@@ -73,11 +73,14 @@ Layer 4: Workspace Customizations (<repo_root>/AGENTS.md & .agents/)
 - **Remediation:**
   - Codify interpreter prefixes in rules (e.g. `bash ./script.sh` or explicit `chmod +x` prior to invocation).
 
-### Archetype 7: Working Directory & Monorepo Path Misalignments
-- **Symptoms:** `fatal: not a git repository`, `ENOENT: no such file or directory`, `collected 0 items`.
-- **Root Cause:** Commands targeting project manifests (such as `package.json`, `Cargo.toml`, or `pyproject.toml`) or tests executed from the repository root instead of the relevant package subdirectory.
+### Archetype 8: Context Magnification & Token Cost Inefficiency
+- **Symptoms:** High token burn across long conversations, slow response latency, context reaching P90 (>240k tokens).
+- **Root Cause:** In multi-turn agent loops (median ~84 API calls), prompt context is re-processed on every turn, causing a ~90x cumulative context magnification factor. Context input represents **~92.8% – 94.5% of total dollar cost**, while tool call arguments represent **~48.3% of model output tokens**. Visible chat prose is <0.4% of cost.
 - **Remediation:**
-  - Specify explicit working directory requirements in `<repo_root>/AGENTS.md` (e.g., prescribing that test runners or build commands execute with explicit `Cwd` targeting the subfolder).
+  - **Surgical Diff Tooling (Layer 2/3):** Enforce `replace_file_content` over whole-file `write_to_file`. Replacing a 10-line block consumes ~50 tokens in tool arguments, whereas rewriting an 800-line file consumes ~4,000 output tokens.
+  - **Bounded File Views (Layer 3):** Always use `view_file` with explicit `StartLine` and `EndLine` parameters (or grep/find first) to prevent injecting megabytes of source files into conversation context history.
+  - **Proactive Compaction Gate (Layer 3):** Trigger `/compact` or summarize history when conversation reaches ~20 turns or context approaches P90 (~240k tokens), before the 90x magnification factor multiplies the accumulated context across remaining turns.
+  - **Prefix Cache Stability (Layer 3/4):** Keep invariant rules, skills, and system instructions in stable prefixes so the prompt cache achieves $\ge 93\%$ cache hit rates ($0.25\times$ pricing discount).
 
 ---
 

@@ -439,7 +439,7 @@ def classify_failure(cmd, response_snippet, exit_code, inline_failure_class=None
 def parse_conversations(
     brain_dirs,
     candidate_repos,
-    max_conversations=50,
+    max_conversations=None,
     since_dt=None,
     until_dt=None,
     target_repo=None,
@@ -484,9 +484,12 @@ def parse_conversations(
             # Determine true conversation start time and prompt preview from user prompt
             start_dt = None
             first_step_text = ""
+            early_tokens = []
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
+                    for line_idx, line in enumerate(f):
+                        if line_idx > 15:
+                            break
                         line_str = line.strip()
                         if not line_str:
                             continue
@@ -501,9 +504,16 @@ def parse_conversations(
                                 )
                         st = d0.get("type", "")
                         source = d0.get("source", "")
-                        if st == "USER_INPUT" or source == "USER_EXPLICIT":
-                            first_step_text = d0.get("content", "") or ""
-                            break
+                        c_text = d0.get("content", "") or ""
+                        if isinstance(c_text, str) and c_text:
+                            early_tokens.append(c_text)
+                            if (
+                                st == "USER_INPUT" or source == "USER_EXPLICIT"
+                            ) and not first_step_text:
+                                first_step_text = c_text
+                        for tc in d0.get("tool_calls", []) or []:
+                            early_tokens.append(tc.get("name") or "")
+                            early_tokens.append(str(tc.get("args") or ""))
             except Exception:
                 pass
 
@@ -515,15 +525,20 @@ def parse_conversations(
 
             # Auto-exclude audit sessions (current active session or sessions executing trajectory audit)
             if auto_exclude_audit:
-                if any(
-                    k in first_step_text
-                    for k in [
-                        "audit_trajectories.py",
-                        "probe_environment.py",
-                        "/improve-agent-efficiency",
-                        "improve-agent-efficiency",
-                    ]
-                ):
+                early_haystack = " ".join(early_tokens).lower()
+                audit_keywords = [
+                    "audit_trajectories",
+                    "probe_environment",
+                    "/improve-agent-efficiency",
+                    "improve-agent-efficiency",
+                    "antigravity token usage analysis",
+                    "token usage analysis",
+                    "trajectory audit",
+                    "analyze_token_landmarks",
+                    "clean_cohort_session_ids",
+                    "trajectory_audit_summary",
+                ]
+                if any(k in early_haystack for k in audit_keywords):
                     continue
 
             if until_dt and start_dt > until_dt:
@@ -632,7 +647,9 @@ def parse_conversations(
                     tname_item = tc_item.get("name") or "other"
                     targs = tc_item.get("args") or {}
                     targs_str = (
-                        json.dumps(targs) if isinstance(targs, dict) else str(targs)
+                        json.dumps(targs, ensure_ascii=False)
+                        if isinstance(targs, dict)
+                        else str(targs)
                     )
                     planner_tool_args_chars += len(targs_str)
                     tool_args_chars_by_tool[tname_item] += len(targs_str)
@@ -1264,11 +1281,16 @@ def calculate_cohort_summary(conv_list):
     has_api_gt = num_api_convs > 0 and (
         total_api_input_tok > 0 or total_api_cache_read_tok > 0
     )
-    total_api_context_all = (
-        total_api_input_tok + total_api_cache_read_tok + total_api_output_tok
-    )
+    total_api_context_processed = total_api_input_tok + total_api_cache_read_tok
+    total_api_tokens_all = total_api_context_processed + total_api_output_tok
+
     api_context_per_conv = (
-        round(total_api_context_all / num_api_convs)
+        round(total_api_context_processed / num_api_convs)
+        if num_api_convs > 0 and has_api_gt
+        else None
+    )
+    api_total_tokens_per_conv = (
+        round(total_api_tokens_all / num_api_convs)
         if num_api_convs > 0 and has_api_gt
         else None
     )
@@ -1297,15 +1319,20 @@ def calculate_cohort_summary(conv_list):
         if has_api_gt and (total_api_input_tok + total_api_cache_read_tok) > 0
         else None
     )
-    est_output_tokens = total_prose_tok + total_tool_args_tok + total_think_tok
+    api_est_output_tokens = sum(
+        (c.get("prose_tokens", 0) or 0)
+        + (c.get("tool_args_tokens", 0) or 0)
+        + (c.get("thinking_tokens", 0) or 0)
+        for c in api_convs
+    )
     calib_ratio = (
-        round(total_api_output_tok / est_output_tokens, 2)
-        if has_api_gt and est_output_tokens > 0
+        round(total_api_output_tok / api_est_output_tokens, 2)
+        if has_api_gt and api_est_output_tokens > 0
         else None
     )
     api_conv_tokens = sum(c["total_tokens"] for c in api_convs)
     cxt_mag_factor = (
-        round(total_api_context_all / api_conv_tokens, 1)
+        round(total_api_context_processed / api_conv_tokens, 1)
         if has_api_gt and api_conv_tokens > 0
         else None
     )
@@ -1446,13 +1473,15 @@ def calculate_cohort_summary(conv_list):
             "input_tokens_fresh": total_api_input_tok if has_api_gt else None,
             "cache_read_tokens": total_api_cache_read_tok if has_api_gt else None,
             "output_tokens_model": total_api_output_tok if has_api_gt else None,
-            "total_api_context_processed": total_api_context_all
+            "total_api_context_processed": total_api_context_processed
             if has_api_gt
             else None,
+            "total_api_tokens_all": total_api_tokens_all if has_api_gt else None,
             "fresh_input_per_conv": api_fresh_per_conv,
             "cache_read_per_conv": api_cache_read_per_conv,
             "output_per_conv": api_output_per_conv,
-            "total_api_per_conv": api_context_per_conv,
+            "context_per_conv": api_context_per_conv,
+            "total_api_per_conv": api_total_tokens_per_conv,
             "cache_hit_rate_pct": cache_hit_rate,
             "calibration": {
                 "output_token_ratio_api_vs_est": calib_ratio,
@@ -2069,8 +2098,8 @@ def run_audit(
         )
         print_row(
             "API Context / Conv (Ground Truth)",
-            base_api.get("total_api_per_conv"),
-            tgt_api.get("total_api_per_conv"),
+            base_api.get("context_per_conv") or base_api.get("total_api_per_conv"),
+            tgt_api.get("context_per_conv") or tgt_api.get("total_api_per_conv"),
             lower_is_better=True,
             is_significant=sig_api_conv,
         )

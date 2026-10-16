@@ -466,6 +466,16 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
                 any("Invalid YAML frontmatter" in v for v in violations_dup)
             )
 
+            # Unhashable YAML keys (e.g. list/mapping as key) should be rejected cleanly
+            (bad_skill / "SKILL.md").write_text(
+                "---\n? [unhashable, key]\n: value\nname: bad-skill\ndescription: unhashable key\n---\n# Unhashable\n",
+                encoding="utf-8",
+            )
+            violations_unhashable = check_repo_safety.check_manifest_integrity(tmp_repo)
+            self.assertTrue(
+                any("Invalid YAML frontmatter" in v for v in violations_unhashable)
+            )
+
             # Valid block scalar frontmatter should pass
             (bad_skill / "SKILL.md").write_text(
                 "---\nname: bad-skill\ndescription: >-\n  Multi-line valid description.\n---\n# Valid\n",
