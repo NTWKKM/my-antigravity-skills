@@ -764,7 +764,7 @@ def parse_conversations(
                 if not isinstance(args, dict):
                     continue
 
-                for k in ["Cwd", "TargetFile", "AbsolutePath"]:
+                for k in ["Cwd", "TargetFile", "AbsolutePath", "Path"]:
                     v = args.get(k)
                     if v and isinstance(v, str):
                         np = norm_path(v)
@@ -781,9 +781,14 @@ def parse_conversations(
                                         reverse=True,
                                     )
 
-                if tname in ["write_to_file", "replace_file_content"]:
-                    target_f = clean_str(args.get("TargetFile"))
-                    if tname == "write_to_file":
+                if tname in [
+                    "write_to_file",
+                    "replace_file_content",
+                    "write_file",
+                    "edit_file",
+                ]:
+                    target_f = clean_str(args.get("Path") or args.get("TargetFile"))
+                    if tname in ("write_to_file", "write_file"):
                         if args.get("Overwrite") is True:
                             write_to_file_modes["overwrite"] += 1
                         elif args.get("Append") is True:
@@ -811,7 +816,7 @@ def parse_conversations(
                         }
                     )
 
-                elif tname == "view_file":
+                elif tname in ("view_file", "read_file"):
                     file_views_count += 1
                     s_line = args.get("StartLine")
                     e_line = args.get("EndLine")
@@ -822,7 +827,7 @@ def parse_conversations(
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
-                        t_file = clean_str(args.get("AbsolutePath"))
+                        t_file = clean_str(args.get("Path") or args.get("AbsolutePath"))
                         try:
                             s_int = int(s_line)
                             e_int = int(e_line)
