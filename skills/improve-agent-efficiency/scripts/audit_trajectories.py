@@ -292,7 +292,7 @@ HEREDOC_PYTHON_RE = re.compile(
     re.IGNORECASE,
 )
 HEREDOC_BODY_RE = re.compile(
-    r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\1[ \t]*(?:\n|$)",
+    r"(?:<<-\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\t*\1[ \t]*(?:\n|$)|<<\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\2[ \t]*(?:\n|$))",
     re.DOTALL,
 )
 MODEL_CHANGE_RE = re.compile(
@@ -468,10 +468,10 @@ def parse_conversations(
     target_repo=None,
     exclude_repo=None,
     exclude_convs=None,
-    include_convs=None,
-    baseline_since_dt=None,
     auto_exclude_audit=True,
     compare_mode=False,
+    include_convs=None,
+    baseline_since_dt=None,
 ):
     sorted_repo_norms = sorted(
         list(candidate_repos.keys()), key=lambda x: len(x), reverse=True
@@ -497,7 +497,6 @@ def parse_conversations(
                 or item.name == "tempmediaStorage"
                 or item.name in seen_conv_ids
                 or item.name in exclude_conv_set
-                or (include_conv_set and item.name not in include_conv_set)
             ):
                 continue
 
@@ -536,8 +535,22 @@ def parse_conversations(
                         c_text = d0.get("content", "") or ""
                         if isinstance(c_text, str) and "Model Selection" in c_text:
                             for m_match in MODEL_CHANGE_RE.findall(c_text):
-                                if m_match.strip():
-                                    head_models.append(m_match.strip())
+                                m_clean = m_match.strip()
+                                if m_clean:
+                                    s_dt = None
+                                    c_str = d0.get("created_at")
+                                    if c_str:
+                                        try:
+                                            s_dt = (
+                                                datetime.fromisoformat(
+                                                    c_str.replace("Z", "+00:00")
+                                                )
+                                                .astimezone()
+                                                .replace(tzinfo=None)
+                                            )
+                                        except Exception:
+                                            pass
+                                    head_models.append((s_dt, m_clean))
 
                         if (
                             st == "USER_INPUT" or source == "USER_EXPLICIT"
@@ -592,7 +605,9 @@ def parse_conversations(
                     continue
 
             if head_models:
-                prior_model_events[item.name] = (start_dt, head_models[-1])
+                prior_model_events[item.name] = [
+                    (s_dt or start_dt, m_name) for s_dt, m_name in head_models
+                ]
 
             # Auto-exclude audit sessions identified strictly by action evidence
             if (
@@ -615,6 +630,9 @@ def parse_conversations(
                 and start_dt < since_dt
                 and start_dt < baseline_since_dt
             ):
+                continue
+
+            if include_conv_set and item.name not in include_conv_set:
                 continue
 
             conv_candidates.append((start_dt.timestamp(), item, tpath, start_dt))
@@ -673,6 +691,7 @@ def parse_conversations(
         has_api_tokens = False
         ephemeral_by_cat = Counter()
         model_changes = []
+        model_events = []
 
         try:
             with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
@@ -699,6 +718,18 @@ def parse_conversations(
                 for m_match in MODEL_CHANGE_RE.findall(content):
                     m_name = m_match.strip()
                     if m_name:
+                        s_dt = None
+                        c_str = step.get("created_at")
+                        if c_str:
+                            try:
+                                s_dt = (
+                                    datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                                    .astimezone()
+                                    .replace(tzinfo=None)
+                                )
+                            except Exception:
+                                pass
+                        model_events.append((s_dt or conv_dt, m_name))
                         model_changes.append(m_name)
                 p_clean = content.strip().replace("\r", " ").replace("\n", " ")
                 if "<USER_REQUEST>" in p_clean:
@@ -1190,6 +1221,7 @@ def parse_conversations(
                 "unbounded_views": file_views_unbounded,
                 "bounded_views": file_views_bounded,
                 "model_changes": model_changes,
+                "model_events": model_events,
                 "model": model_changes[-1] if model_changes else "unknown",
             }
         )
@@ -1200,19 +1232,28 @@ def parse_conversations(
                 baseline_count += 1
 
     # Carry forward active model selection in chronological order across discovered + parsed sessions
-    timeline = [
-        (dt, cid, m_name, None)
-        for cid, (dt, m_name) in prior_model_events.items()
+    unselected_events = [
+        (dt, 0, m_name, None)
+        for cid, evs in prior_model_events.items()
         if all(c["id"] != cid for c in conversations)
-    ] + [(c["dt"], c["id"], None, c) for c in conversations]
+        for dt, m_name in evs
+    ]
+    selected_model_events = [
+        (dt, 0, m_name, c)
+        for c in conversations
+        for dt, m_name in c.get("model_events", [])
+    ]
+    conv_start_events = [(c["dt"], 1, None, c) for c in conversations]
+    timeline = unselected_events + selected_model_events + conv_start_events
     carried_model = "unknown"
-    for _, _, prior_m, conv_obj in sorted(timeline, key=lambda x: (x[0], x[1])):
-        if conv_obj is None:
-            carried_model = prior_m
-        elif conv_obj.get("model_changes"):
-            conv_obj["model"] = conv_obj["model_changes"][0]
-            carried_model = conv_obj["model_changes"][-1]
-        else:
+    for dt, event_type, m_name, conv_obj in sorted(
+        timeline, key=lambda x: (x[0], x[1])
+    ):
+        if event_type == 0:
+            carried_model = m_name
+            if conv_obj is not None and conv_obj.get("model") == "unknown":
+                conv_obj["model"] = m_name
+        elif event_type == 1:
             conv_obj["model"] = carried_model
 
     return conversations, total_candidates
@@ -1821,11 +1862,11 @@ def run_audit(
     target_repo=None,
     exclude_repo=None,
     exclude_conv=None,
-    include_conv=None,
-    baseline_since_date=None,
     auto_exclude_audit=True,
     compare_mode=False,
     print_summary=False,
+    include_conv=None,
+    baseline_since_date=None,
 ):
     base_dir = locate_antigravity_dir()
     brain_dirs = locate_brain_directories(base_dir)
@@ -1911,13 +1952,15 @@ def run_audit(
             exclude_conv_list = list(exclude_conv)
 
     include_conv_list = []
-    if include_conv:
+    if include_conv is not None:
         if isinstance(include_conv, str):
             include_conv_list = [
                 c.strip() for c in include_conv.split(",") if c.strip()
             ]
         else:
-            include_conv_list = list(include_conv)
+            include_conv_list = [str(c).strip() for c in include_conv if str(c).strip()]
+        if not include_conv_list:
+            raise ValueError("--conv requires at least one conversation ID")
 
     print("=== Antigravity Trajectory Auditor ===")
     print(f"Platform: {platform.system()} ({platform.machine()})")
