@@ -93,7 +93,9 @@ py -3.10 "<SkillDir>\scripts\audit_trajectories.py" "<ScratchDir>" --since <YYYY
 
 #### Supported Mining Flags (`audit_trajectories.py`)
 - `--since YYYY-MM-DD` / `--until YYYY-MM-DD`: Bound the evaluation time window.
+- `--baseline-since YYYY-MM-DD`: Bound the lower date of the baseline cohort in `--compare` mode (e.g. a 14-day pre-fix window instead of full history).
 - `--compare`: Compare target window (`>= --since`) against baseline (`< --since`) with 1,000-iteration conversation-level bootstrap tests.
+- `--conv <id1,id2>`: Audit only the specified conversation IDs (includes audit sessions automatically and emits a `per_conversation` breakdown).
 - `--repo <keyword>` / `--exclude <name1,name2>` / `--exclude-conv <id1,id2>`: Filter by repository or conversation ID (applied before `--limit`).
 - `--limit <N>` (default `100`) / `--all`: Cap evaluated conversations after repo filtering, or parse all sessions.
 - `--include-audit-sessions`: Include meta/audit sessions (excluded by default).

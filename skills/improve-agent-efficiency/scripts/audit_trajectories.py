@@ -287,6 +287,29 @@ INLINE_PREFIXES = (
     "powershell -c",
 )
 
+HEREDOC_PYTHON_RE = re.compile(
+    r"\bpython3?(?:\.\d+)?\b[^\n;|&]*<<-?\s*['\"]?\w+['\"]?",
+    re.IGNORECASE,
+)
+HEREDOC_BODY_RE = re.compile(
+    r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\1[ \t]*(?:\n|$)",
+    re.DOTALL,
+)
+MODEL_CHANGE_RE = re.compile(
+    r"changed setting `Model Selection` from [^\n]*? to ([^\n<]+?)\.(?:\s|<|$)"
+)
+
+
+def is_python_heredoc(cmd_str):
+    return bool(HEREDOC_PYTHON_RE.search(cmd_str or ""))
+
+
+def is_inline_script_command(cmd_str):
+    if not cmd_str:
+        return False
+    stripped = HEREDOC_BODY_RE.sub("", cmd_str).lower()
+    return any(p in stripped for p in INLINE_PREFIXES)
+
 
 def determine_inline_failure_class(cmd_str, resp_content):
     resp_tail = (
@@ -357,7 +380,7 @@ def classify_failure(cmd, response_snippet, exit_code, inline_failure_class=None
         k in snip for k in ["failed:", "assertionerror", "test session starts", "fail"]
     ):
         return "Test Assertion / TDD Failure"
-    if any(p in cmd_lower for p in INLINE_PREFIXES):
+    if is_inline_script_command(cmd):
         if inline_failure_class is None:
             inline_failure_class = determine_inline_failure_class(
                 cmd, response_snippet or ""
@@ -445,6 +468,8 @@ def parse_conversations(
     target_repo=None,
     exclude_repo=None,
     exclude_convs=None,
+    include_convs=None,
+    baseline_since_dt=None,
     auto_exclude_audit=True,
     compare_mode=False,
 ):
@@ -459,6 +484,8 @@ def parse_conversations(
         brain_dirs = [brain_dirs]
 
     exclude_conv_set = set(exclude_convs) if exclude_convs else set()
+    include_conv_set = set(include_convs) if include_convs else set()
+    prior_model_events = {}
 
     for brain_dir in brain_dirs:
         if not brain_dir or not brain_dir.exists():
@@ -470,6 +497,7 @@ def parse_conversations(
                 or item.name == "tempmediaStorage"
                 or item.name in seen_conv_ids
                 or item.name in exclude_conv_set
+                or (include_conv_set and item.name not in include_conv_set)
             ):
                 continue
 
@@ -485,6 +513,7 @@ def parse_conversations(
             start_dt = None
             first_step_text = ""
             is_audit_session = False
+            head_models = []
             try:
                 with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
                     for line_idx, line in enumerate(f):
@@ -505,6 +534,10 @@ def parse_conversations(
                         st = d0.get("type", "")
                         source = d0.get("source", "")
                         c_text = d0.get("content", "") or ""
+                        if isinstance(c_text, str) and "Model Selection" in c_text:
+                            for m_match in MODEL_CHANGE_RE.findall(c_text):
+                                if m_match.strip():
+                                    head_models.append(m_match.strip())
 
                         if (
                             st == "USER_INPUT" or source == "USER_EXPLICIT"
@@ -558,8 +591,15 @@ def parse_conversations(
                 except Exception:
                     continue
 
+            if head_models:
+                prior_model_events[item.name] = (start_dt, head_models[-1])
+
             # Auto-exclude audit sessions identified strictly by action evidence
-            if auto_exclude_audit and is_audit_session:
+            if (
+                auto_exclude_audit
+                and is_audit_session
+                and item.name not in include_conv_set
+            ):
                 continue
 
             if until_dt and start_dt > until_dt:
@@ -567,6 +607,14 @@ def parse_conversations(
 
             # When comparing, we keep both cohorts (target >= since_dt and baseline < since_dt)
             if since_dt and not compare_mode and start_dt < since_dt:
+                continue
+            if (
+                compare_mode
+                and since_dt
+                and baseline_since_dt
+                and start_dt < since_dt
+                and start_dt < baseline_since_dt
+            ):
                 continue
 
             conv_candidates.append((start_dt.timestamp(), item, tpath, start_dt))
@@ -624,6 +672,7 @@ def parse_conversations(
         api_output_tokens = 0
         has_api_tokens = False
         ephemeral_by_cat = Counter()
+        model_changes = []
 
         try:
             with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
@@ -647,6 +696,10 @@ def parse_conversations(
                 user_turns_count += 1
                 user_turn_indices.append(i)
                 total_prompt_chars += len(content)
+                for m_match in MODEL_CHANGE_RE.findall(content):
+                    m_name = m_match.strip()
+                    if m_name:
+                        model_changes.append(m_name)
                 p_clean = content.strip().replace("\r", " ").replace("\n", " ")
                 if "<USER_REQUEST>" in p_clean:
                     start = p_clean.find("<USER_REQUEST>") + len("<USER_REQUEST>")
@@ -887,10 +940,12 @@ def parse_conversations(
                     ):
                         is_failed = True
 
-                    is_inline = any(p in cmd_str.lower() for p in INLINE_PREFIXES)
+                    is_heredoc_py = is_python_heredoc(cmd_str)
+                    is_inline = is_inline_script_command(cmd_str)
                     # Genuinely multi-line scripts contain real line breaks
+                    cmd_no_heredoc = HEREDOC_BODY_RE.sub("", cmd_str)
                     is_multiline_inline = is_inline and (
-                        "\n" in cmd_str or "\r" in cmd_str
+                        "\n" in cmd_no_heredoc or "\r" in cmd_no_heredoc
                     )
                     is_oneline_inline = is_inline and not is_multiline_inline
                     run_cmd_output_chars += len(resp_content)
@@ -912,6 +967,7 @@ def parse_conversations(
                             "action": clean_str(args.get("toolAction")),
                             "exit_code": exit_code,
                             "is_failed": is_failed,
+                            "is_heredoc_python": is_heredoc_py,
                             "is_multiline_inline": is_multiline_inline,
                             "is_oneline_inline": is_oneline_inline,
                             "inline_failure_class": inline_failure_class,
@@ -1133,6 +1189,8 @@ def parse_conversations(
                 "file_views": file_views_count,
                 "unbounded_views": file_views_unbounded,
                 "bounded_views": file_views_bounded,
+                "model_changes": model_changes,
+                "model": model_changes[-1] if model_changes else "unknown",
             }
         )
         if compare_mode and since_dt:
@@ -1140,6 +1198,22 @@ def parse_conversations(
                 target_count += 1
             else:
                 baseline_count += 1
+
+    # Carry forward active model selection in chronological order across discovered + parsed sessions
+    timeline = [
+        (dt, cid, m_name, None)
+        for cid, (dt, m_name) in prior_model_events.items()
+        if all(c["id"] != cid for c in conversations)
+    ] + [(c["dt"], c["id"], None, c) for c in conversations]
+    carried_model = "unknown"
+    for _, _, prior_m, conv_obj in sorted(timeline, key=lambda x: (x[0], x[1])):
+        if conv_obj is None:
+            carried_model = prior_m
+        elif conv_obj.get("model_changes"):
+            conv_obj["model"] = conv_obj["model_changes"][0]
+            carried_model = conv_obj["model_changes"][-1]
+        else:
+            conv_obj["model"] = carried_model
 
     return conversations, total_candidates
 
@@ -1187,12 +1261,24 @@ def calculate_cohort_summary(conv_list):
         for cmd in c["commands"]
         if cmd.get("is_oneline_inline") and cmd["is_failed"]
     )
+    heredoc_python_total = sum(
+        1 for c in conv_list for cmd in c["commands"] if cmd.get("is_heredoc_python")
+    )
+    heredoc_python_failed = sum(
+        1
+        for c in conv_list
+        for cmd in c["commands"]
+        if cmd.get("is_heredoc_python") and cmd["is_failed"]
+    )
+    model_mix = Counter(c.get("model", "unknown") for c in conv_list)
 
     inline_failures_by_class = Counter()
     for c in conv_list:
         for cmd_entry in c["commands"]:
             cmd = cmd_entry["command"]
-            if any(p in cmd.lower() for p in INLINE_PREFIXES):
+            if cmd_entry.get("is_multiline_inline") or cmd_entry.get(
+                "is_oneline_inline"
+            ):
                 py_c_count += 1
             if re.search(r"\b(grep|cat|rm -rf|ls -la)\b", cmd):
                 bash_syntax_count += 1
@@ -1302,6 +1388,7 @@ def calculate_cohort_summary(conv_list):
 
     api_convs = [c for c in conv_list if c.get("has_api_tokens", False)]
     num_api_convs = len(api_convs)
+    api_user_turns = sum(c["user_turns"] for c in api_convs)
     total_api_input_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
     total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
     total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
@@ -1334,6 +1421,21 @@ def calculate_cohort_summary(conv_list):
     api_output_per_conv = (
         round(total_api_output_tok / num_api_convs)
         if num_api_convs > 0 and has_api_gt
+        else None
+    )
+    api_context_per_turn = (
+        round(total_api_context_processed / api_user_turns)
+        if api_user_turns > 0 and has_api_gt
+        else None
+    )
+    api_fresh_per_turn = (
+        round(total_api_input_tok / api_user_turns)
+        if api_user_turns > 0 and has_api_gt
+        else None
+    )
+    api_output_per_turn = (
+        round(total_api_output_tok / api_user_turns)
+        if api_user_turns > 0 and has_api_gt
         else None
     )
     cache_hit_rate = (
@@ -1443,6 +1545,14 @@ def calculate_cohort_summary(conv_list):
             if py_c_oneline_total > 0
             else 0.0,
         },
+        "heredoc_python": {
+            "total": heredoc_python_total,
+            "failed": heredoc_python_failed,
+            "fail_pct": round((heredoc_python_failed / heredoc_python_total * 100), 2)
+            if heredoc_python_total > 0
+            else 0.0,
+        },
+        "model_mix": dict(model_mix),
         "inline_failures_by_class": dict(inline_failures_by_class),
         "bash_syntax": bash_syntax_count,
         "file_views": total_views,
@@ -1509,6 +1619,9 @@ def calculate_cohort_summary(conv_list):
             "output_per_conv": api_output_per_conv,
             "context_per_conv": api_context_per_conv,
             "total_api_per_conv": api_total_tokens_per_conv,
+            "fresh_input_per_turn": api_fresh_per_turn,
+            "output_per_turn": api_output_per_turn,
+            "context_per_turn": api_context_per_turn,
             "cache_hit_rate_pct": cache_hit_rate,
             "calibration": {
                 "output_token_ratio_api_vs_est": calib_ratio,
@@ -1708,6 +1821,8 @@ def run_audit(
     target_repo=None,
     exclude_repo=None,
     exclude_conv=None,
+    include_conv=None,
+    baseline_since_date=None,
     auto_exclude_audit=True,
     compare_mode=False,
     print_summary=False,
@@ -1729,6 +1844,22 @@ def run_audit(
                 )
         if since_dt and since_dt.tzinfo is not None:
             since_dt = since_dt.astimezone().replace(tzinfo=None)
+
+    baseline_since_dt = None
+    if baseline_since_date:
+        try:
+            baseline_since_dt = datetime.fromisoformat(
+                baseline_since_date.replace("Z", "+00:00")
+            )
+        except Exception:
+            try:
+                baseline_since_dt = datetime.strptime(baseline_since_date, "%Y-%m-%d")
+            except Exception:
+                print(
+                    f"Warning: Could not parse --baseline-since '{baseline_since_date}'. Ignoring filter."
+                )
+        if baseline_since_dt and baseline_since_dt.tzinfo is not None:
+            baseline_since_dt = baseline_since_dt.astimezone().replace(tzinfo=None)
 
     until_dt = None
     if until_date:
@@ -1779,6 +1910,15 @@ def run_audit(
         else:
             exclude_conv_list = list(exclude_conv)
 
+    include_conv_list = []
+    if include_conv:
+        if isinstance(include_conv, str):
+            include_conv_list = [
+                c.strip() for c in include_conv.split(",") if c.strip()
+            ]
+        else:
+            include_conv_list = list(include_conv)
+
     print("=== Antigravity Trajectory Auditor ===")
     print(f"Platform: {platform.system()} ({platform.machine()})")
     print(f"Antigravity Data Dir: {base_dir}")
@@ -1797,6 +1937,8 @@ def run_audit(
     print(
         f"Exclude Convs: {', '.join(exclude_conv_list) if exclude_conv_list else 'None'}"
     )
+    if include_conv_list:
+        print(f"Include Convs: {', '.join(include_conv_list)}")
     print(f"Auto-Exclude Audit Sessions: {auto_exclude_audit}")
 
     ide_workspaces = discover_ide_workspaces(ws_storage_dir)
@@ -1811,6 +1953,8 @@ def run_audit(
         target_repo=target_repo,
         exclude_repo=exclude_list,
         exclude_convs=exclude_conv_list,
+        include_convs=include_conv_list,
+        baseline_since_dt=baseline_since_dt,
         auto_exclude_audit=auto_exclude_audit,
         compare_mode=compare_mode,
     )
@@ -1822,7 +1966,12 @@ def run_audit(
     if compare_mode and since_dt:
         # Partition conversations by start timestamp
         target_convs = [c for c in all_convs if c["dt"] >= since_dt]
-        baseline_convs = [c for c in all_convs if c["dt"] < since_dt]
+        baseline_convs = [
+            c
+            for c in all_convs
+            if c["dt"] < since_dt
+            and (not baseline_since_dt or c["dt"] >= baseline_since_dt)
+        ]
         if max_conversations and max_conversations > 0:
             target_convs = target_convs[:max_conversations]
             baseline_convs = baseline_convs[:max_conversations]
@@ -2171,6 +2320,9 @@ def run_audit(
             "platform": platform.system(),
             "mode": "comparative",
             "since_filter": since_dt.isoformat() if since_dt else None,
+            "baseline_since_filter": baseline_since_dt.isoformat()
+            if baseline_since_dt
+            else None,
             "until_filter": until_dt.isoformat() if until_dt else None,
             "comparison": {
                 "target_window": target_summary,
@@ -2249,9 +2401,17 @@ def run_audit(
             "platform": platform.system(),
             "mode": "standard",
             "since_filter": since_dt.isoformat() if since_dt else None,
+            "baseline_since_filter": baseline_since_dt.isoformat()
+            if baseline_since_dt
+            else None,
             "target_repo": target_repo,
             "exclude_filter": exclude_list,
             **summary,
+        }
+
+    if include_conv_list:
+        summary_payload["per_conversation"] = {
+            c["id"]: calculate_cohort_summary([c]) for c in all_convs
         }
 
     with open(out_file, "w", encoding="utf-8") as f:
@@ -2310,6 +2470,18 @@ if __name__ == "__main__":
         help="Comma-separated conversation IDs to exclude from audit",
     )
     parser.add_argument(
+        "--conv",
+        type=str,
+        default=None,
+        help="Comma-separated conversation IDs to audit exclusively (implies --include-audit-sessions for named IDs)",
+    )
+    parser.add_argument(
+        "--baseline-since",
+        type=str,
+        default=None,
+        help="Lower date bound for baseline cohort in --compare mode (YYYY-MM-DD or ISO)",
+    )
+    parser.add_argument(
         "--include-audit-sessions",
         action="store_true",
         default=False,
@@ -2344,6 +2516,8 @@ if __name__ == "__main__":
             target_repo=args.repo,
             exclude_repo=args.exclude,
             exclude_conv=args.exclude_conv,
+            include_conv=args.conv,
+            baseline_since_date=args.baseline_since,
             auto_exclude_audit=not args.include_audit_sessions,
             compare_mode=args.compare,
             print_summary=args.print_summary,
