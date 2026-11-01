@@ -812,5 +812,363 @@ class TestRepoSafetyAndPackaging(unittest.TestCase):
         self.assertEqual(root_copy, skill_copy)
 
 
+class TestAuditScopingAndAttribution(unittest.TestCase):
+    """--conv / --baseline-since scoping, per-turn API normalization, heredoc and model attribution."""
+
+    def _write_conv(self, brain, cid, ts, extra_steps=(), model_to=None, api=None):
+        log_dir = brain / cid / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True)
+        content = "<USER_REQUEST>do work</USER_REQUEST>"
+        if model_to:
+            content += (
+                "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` "
+                f"from None to {model_to}. No need to comment.</USER_SETTINGS_CHANGE>"
+            )
+        steps = [
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": ts,
+                "content": content,
+            }
+        ]
+        if api:
+            steps.append(
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "ok",
+                    "input_tokens": api[0],
+                    "cache_read_tokens": api[1],
+                    "output_tokens": api[2],
+                }
+            )
+        steps += list(extra_steps)
+        (log_dir / "transcript_full.jsonl").write_text(
+            "\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8"
+        )
+
+    def _run(self, tmp_path, brain, **kwargs):
+        out_dir = tmp_path / "out"
+        with (
+            mock.patch.object(
+                audit_trajectories, "locate_antigravity_dir", return_value=tmp_path
+            ),
+            mock.patch.object(
+                audit_trajectories, "locate_brain_directories", return_value=[brain]
+            ),
+            mock.patch.object(
+                audit_trajectories, "locate_ide_workspace_storage", return_value=None
+            ),
+            mock.patch.object(
+                audit_trajectories, "discover_git_repositories", return_value={}
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            out = audit_trajectories.run_audit(
+                output_dir=str(out_dir), max_conversations=None, **kwargs
+            )
+        return json.loads(Path(out).read_text(encoding="utf-8"))
+
+    def test_heredoc_is_counted_separately_from_inline_py_c(self):
+        """A python heredoc whose body mentions 'python3 -c' is a heredoc, not an inline script."""
+        heredoc = (
+            "python3 - <<'PY'\nlabel = 'Inline python3 -c / 100 cmds'\nprint(label)\nPY"
+        )
+        steps = [
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "run_command",
+                        "args": {"CommandLine": heredoc, "Cwd": "/tmp"},
+                    }
+                ],
+            },
+            {
+                "step_index": 3,
+                "type": "TOOL_RESPONSE",
+                "content": "Command exited with code 0.\nOutput:\nInline",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(brain, "conv-h", "2026-10-15T10:00:00Z", steps)
+            data = self._run(tmp_path, brain)
+            self.assertEqual(data["py_c_multiline"]["total"], 0)
+            self.assertEqual(data["py_c_oneline"]["total"], 0)
+            self.assertEqual(data["heredoc_python"]["total"], 1)
+
+    def test_conv_filter_reports_each_requested_conversation(self):
+        """include_conv keeps only the named sessions (audit sessions included) and reports each one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(brain, "conv-a", "2026-10-15T10:00:00Z", api=(10, 90, 5))
+            self._write_conv(brain, "conv-b", "2026-10-16T10:00:00Z", api=(20, 80, 5))
+            self._write_conv(brain, "conv-c", "2026-10-17T10:00:00Z", api=(30, 70, 5))
+            data = self._run(tmp_path, brain, include_conv="conv-a,conv-c")
+            self.assertEqual(data["conversations"], 2)
+            self.assertEqual(
+                sorted(data["per_conversation"].keys()), ["conv-a", "conv-c"]
+            )
+            self.assertEqual(data["per_conversation"]["conv-c"]["conversations"], 1)
+
+    def test_api_ground_truth_is_normalized_per_user_turn(self):
+        """Context, fresh input and output are also reported per user turn (pooled)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(
+                brain,
+                "conv-a",
+                "2026-10-15T10:00:00Z",
+                api=(100, 900, 50),
+                extra_steps=[
+                    {
+                        "step_index": 2,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-10-15T10:05:00Z",
+                        "content": "follow-up request",
+                    },
+                    {
+                        "step_index": 3,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "ok",
+                        "input_tokens": 300,
+                        "cache_read_tokens": 700,
+                        "output_tokens": 150,
+                    },
+                ],
+            )
+            data = self._run(tmp_path, brain)
+            api = data["api_tokens_ground_truth"]
+            self.assertEqual(data["user_turns"], 2)
+            self.assertEqual(api["context_per_turn"], 1000)
+            self.assertEqual(api["fresh_input_per_turn"], 200)
+            self.assertEqual(api["output_per_turn"], 100)
+            self.assertNotEqual(
+                api["context_per_turn"], api["total_api_context_processed"]
+            )
+            self.assertNotEqual(api["fresh_input_per_turn"], api["input_tokens_fresh"])
+            self.assertNotEqual(api["output_per_turn"], api["output_tokens_model"])
+
+    def test_baseline_since_bounds_the_baseline_cohort(self):
+        """--baseline-since drops baseline sessions older than the given date."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            for cid, ts in [
+                ("old", "2026-09-01T10:00:00Z"),
+                ("recent", "2026-10-20T10:00:00Z"),
+                ("target", "2026-10-26T10:00:00Z"),
+            ]:
+                self._write_conv(brain, cid, ts)
+            data = self._run(
+                tmp_path,
+                brain,
+                since_date="2026-10-25",
+                baseline_since_date="2026-10-11",
+                compare_mode=True,
+            )
+            self.assertEqual(data["comparison"]["baseline_window"]["conversations"], 1)
+            self.assertEqual(data["comparison"]["target_window"]["conversations"], 1)
+            self.assertTrue(data["baseline_since_filter"].startswith("2026-10-11"))
+
+    def test_model_selection_is_parsed_and_carried_forward(self):
+        """The model persists across sessions until the next explicit switch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(
+                brain,
+                "conv-1",
+                "2026-10-15T10:00:00Z",
+                model_to="Claude Opus 5.5 (Medium)",
+            )
+            self._write_conv(brain, "conv-2", "2026-10-16T10:00:00Z")
+            self._write_conv(
+                brain,
+                "conv-3",
+                "2026-10-17T10:00:00Z",
+                model_to="Gemini 4 Argon (Medium)",
+            )
+            data = self._run(tmp_path, brain, include_conv="conv-1,conv-2,conv-3")
+            per = data["per_conversation"]
+            self.assertEqual(
+                per["conv-2"]["model_mix"], {"Claude Opus 5.5 (Medium)": 1}
+            )
+            self.assertEqual(per["conv-3"]["model_mix"], {"Gemini 4 Argon (Medium)": 1})
+            self.assertEqual(data["model_mix"]["Claude Opus 5.5 (Medium)"], 2)
+
+    def test_cli_exposes_new_scoping_flags(self):
+        import subprocess
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(EFFICIENCY_SCRIPTS / "audit_trajectories.py"),
+                "--help",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn("--conv", r.stdout)
+        self.assertIn("--baseline-since", r.stdout)
+
+    def test_heredoc_tab_indented_body_is_stripped(self):
+        """A tab-indented <<- heredoc containing 'python3 -c' in body is counted as heredoc, not inline."""
+        heredoc = "python3 - <<-PY\n\tline = 'python3 -c inline'\n\tprint(line)\n\tPY"
+        extra = [
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "run_command",
+                        "args": {"CommandLine": heredoc, "Cwd": "/tmp"},
+                    }
+                ],
+            },
+            {
+                "step_index": 3,
+                "type": "TOOL_RESPONSE",
+                "content": "Command exited with code 0.\nOutput:\nInline",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(
+                brain, "conv-tab-h", "2026-10-15T10:00:00Z", extra_steps=extra
+            )
+            data = self._run(tmp_path, brain)
+            self.assertEqual(data["py_c_multiline"]["total"], 0)
+            self.assertEqual(data["py_c_oneline"]["total"], 0)
+            self.assertEqual(data["heredoc_python"]["total"], 1)
+
+    def test_positional_arguments_compatibility(self):
+        """Calling parse_conversations and run_audit positionally preserves existing argument mapping."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(brain, "conv-pos", "2026-10-15T10:00:00Z")
+            convs, total = audit_trajectories.parse_conversations(
+                [brain],
+                {},
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,  # auto_exclude_audit
+                False,  # compare_mode
+            )
+            self.assertEqual(len(convs), 1)
+            self.assertEqual(total, 1)
+
+            out_dir = tmp_path / "out"
+            with (
+                mock.patch.object(
+                    audit_trajectories, "locate_antigravity_dir", return_value=tmp_path
+                ),
+                mock.patch.object(
+                    audit_trajectories, "locate_brain_directories", return_value=[brain]
+                ),
+                mock.patch.object(
+                    audit_trajectories,
+                    "locate_ide_workspace_storage",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    audit_trajectories, "discover_git_repositories", return_value={}
+                ),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                out = audit_trajectories.run_audit(
+                    str(out_dir),
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    True,  # auto_exclude_audit
+                    False,  # compare_mode
+                    False,  # print_summary
+                )
+                data = json.loads(Path(out).read_text(encoding="utf-8"))
+                self.assertEqual(data["conversations"], 1)
+
+    def test_conv_filter_preserves_unselected_model_history(self):
+        """A conversation selected by --conv inherits model set by an unselected previous conversation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(
+                brain,
+                "conv-1",
+                "2026-10-15T10:00:00Z",
+                model_to="Claude Opus 5.5 (Medium)",
+            )
+            self._write_conv(brain, "conv-2", "2026-10-16T10:00:00Z")
+            data = self._run(tmp_path, brain, include_conv="conv-2")
+            self.assertEqual(data["conversations"], 1)
+            self.assertEqual(
+                data["per_conversation"]["conv-2"]["model_mix"],
+                {"Claude Opus 5.5 (Medium)": 1},
+            )
+            self.assertEqual(data["model_mix"]["Claude Opus 5.5 (Medium)"], 1)
+
+    def test_model_changes_applied_at_event_times(self):
+        """Conversations starting before a mid-session model switch do not inherit that model."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            extra_conv1 = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": "2026-10-15T12:00:00Z",
+                    "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Claude Opus 5.5 (Medium).\n</USER_SETTINGS_CHANGE>",
+                },
+            ]
+            self._write_conv(
+                brain, "conv-1", "2026-10-15T10:00:00Z", extra_steps=extra_conv1
+            )
+            self._write_conv(brain, "conv-2", "2026-10-15T11:00:00Z")
+            self._write_conv(brain, "conv-3", "2026-10-15T13:00:00Z")
+
+            data = self._run(tmp_path, brain, include_conv="conv-1,conv-2,conv-3")
+            per = data["per_conversation"]
+            self.assertEqual(
+                per["conv-1"]["model_mix"], {"Claude Opus 5.5 (Medium)": 1}
+            )
+            self.assertEqual(per["conv-2"]["model_mix"], {"unknown": 1})
+            self.assertEqual(
+                per["conv-3"]["model_mix"], {"Claude Opus 5.5 (Medium)": 1}
+            )
+
+    def test_empty_conv_selection_raises_value_error(self):
+        """Passing an empty string or whitespace/commas to include_conv raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_conv(brain, "conv-1", "2026-10-15T10:00:00Z")
+            with self.assertRaises(ValueError):
+                self._run(tmp_path, brain, include_conv="")
+            with self.assertRaises(ValueError):
+                self._run(tmp_path, brain, include_conv=" , ")
+
+
 if __name__ == "__main__":
     unittest.main()
