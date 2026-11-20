@@ -1170,5 +1170,984 @@ class TestAuditScopingAndAttribution(unittest.TestCase):
                 self._run(tmp_path, brain, include_conv=" , ")
 
 
+class TestAuditHardeningAndParity(unittest.TestCase):
+    def _write_steps(self, brain_dir, conv_id, steps):
+        log_dir = brain_dir / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "transcript_full.jsonl", "w", encoding="utf-8") as f:
+            for step in steps:
+                f.write(json.dumps(step) + "\n")
+
+    def _run_with_brain(self, tmp_path, brain_dir, config_dir=None, **kwargs):
+        out_dir = tmp_path / "out"
+        with (
+            mock.patch.object(
+                audit_trajectories, "locate_antigravity_dir", return_value=tmp_path
+            ),
+            mock.patch.object(
+                audit_trajectories,
+                "locate_brain_directories",
+                return_value=[brain_dir],
+            ),
+            mock.patch.object(
+                audit_trajectories,
+                "locate_ide_workspace_storage",
+                return_value=None,
+            ),
+            mock.patch.object(
+                audit_trajectories,
+                "discover_git_repositories",
+                return_value={},
+            ),
+        ):
+            out_file = audit_trajectories.run_audit(
+                output_dir=str(out_dir),
+                config_dir=config_dir,
+                **kwargs,
+            )
+        return json.loads(Path(out_file).read_text(encoding="utf-8"))
+
+    def test_interactive_vs_subagent_separation_and_total_cost(self):
+        """Interactive sessions stay cleanly separated from user_turns==0 subagents while preserving total API spend."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+
+            # 1 interactive session (2 user turns, 1,000 total API tokens)
+            self._write_steps(
+                brain,
+                "interactive-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Build feature</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:05Z",
+                        "content": "Done step 1",
+                        "input_tokens": 200,
+                        "cache_read_tokens": 700,
+                        "output_tokens": 100,
+                    },
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:01:00Z",
+                        "content": "<USER_REQUEST>Follow up</USER_REQUEST>",
+                    },
+                ],
+            )
+            # 3 subagent/headless sessions (0 user turns, 500 total API tokens each = 1,500)
+            for idx in range(1, 4):
+                self._write_steps(
+                    brain,
+                    f"subagent-{idx}",
+                    [
+                        {
+                            "type": "SYSTEM_MESSAGE",
+                            "source": "SYSTEM_SDK",
+                            "created_at": f"2026-11-10T10:0{idx}:00Z",
+                            "content": "Subagent task prompt",
+                        },
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "source": "MODEL",
+                            "created_at": f"2026-11-10T10:0{idx}:05Z",
+                            "content": "Subagent reply",
+                            "input_tokens": 100,
+                            "cache_read_tokens": 350,
+                            "output_tokens": 50,
+                        },
+                    ],
+                )
+
+            data = self._run_with_brain(tmp_path, brain, config_dir=tmp_path / "nocfg")
+            self.assertEqual(data["conversations"], 1)
+            self.assertEqual(data["interactive_conversations"], 1)
+            self.assertEqual(data["subagent_or_headless_conversations"], 3)
+            self.assertGreaterEqual(data["median_turns_per_conv"], 1.0)
+            self.assertEqual(data["median_turns_per_conv"], 2.0)
+            self.assertEqual(
+                data["api_tokens_ground_truth"]["total_api_tokens_all"], 1000
+            )
+            self.assertEqual(data["subagent_summary"]["conversations"], 3)
+            self.assertEqual(
+                data["subagent_summary"]["api_tokens_ground_truth"][
+                    "total_api_tokens_all"
+                ],
+                1500,
+            )
+            self.assertEqual(data["total_api_tokens_including_subagents"], 2500)
+
+            # With --include-subagents, all 4 conversations are merged into primary cohort
+            merged = self._run_with_brain(
+                tmp_path,
+                brain,
+                config_dir=tmp_path / "nocfg",
+                include_subagents=True,
+            )
+            self.assertEqual(merged["conversations"], 4)
+            self.assertEqual(merged["median_turns_per_conv"], 0.0)
+            self.assertEqual(
+                merged["api_tokens_ground_truth"]["total_api_tokens_all"], 2500
+            )
+
+    def test_antigravity_2_0_tool_parity(self):
+        """Antigravity 2.0 tools (read_file/write_file/edit_file) produce identical metrics to legacy tools."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain_legacy = tmp_path / "brain_legacy"
+            brain_v2 = tmp_path / "brain_v2"
+            target_path = "/workspace/demo/app.py"
+
+            def _make_steps(read_tool, write_tool, edit_tool, path_key):
+                return [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Refactor app.py</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:01Z",
+                        "content": "Reading",
+                        "tool_calls": [
+                            {
+                                "name": read_tool,
+                                "args": {
+                                    path_key: target_path,
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "name": read_tool,
+                                "args": {
+                                    path_key: target_path,
+                                    "StartLine": 6,
+                                    "EndLine": 15,
+                                },
+                            },
+                            {
+                                "name": read_tool,
+                                "args": {path_key: "/workspace/demo/other.py"},
+                            },
+                        ],
+                    },
+                    {"type": "GENERIC", "source": "MODEL", "content": "x" * 100},
+                    {"type": "GENERIC", "source": "MODEL", "content": "y" * 100},
+                    {"type": "GENERIC", "source": "MODEL", "content": "z" * 200},
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:05Z",
+                        "content": "Editing and writing",
+                        "tool_calls": [
+                            {
+                                "name": edit_tool,
+                                "args": {path_key: target_path, "Replacement": "ok"},
+                            },
+                            {
+                                "name": write_tool,
+                                "args": {
+                                    path_key: "/workspace/demo/new.py",
+                                    "Content": "a",
+                                },
+                            },
+                            {
+                                "name": write_tool,
+                                "args": {
+                                    path_key: "/workspace/demo/over.py",
+                                    "Overwrite": True,
+                                    "Content": "b",
+                                },
+                            },
+                            {
+                                "name": write_tool,
+                                "args": {
+                                    path_key: "/workspace/demo/log.txt",
+                                    "Append": True,
+                                    "Content": "c",
+                                },
+                            },
+                            {
+                                "name": "call_mcp_tool",
+                                "args": {
+                                    "ServerName": "stitch",
+                                    "ToolName": "list_projects",
+                                },
+                            },
+                            {
+                                "name": "invoke_subagent",
+                                "args": {"TypeName": "research", "Prompt": "check"},
+                            },
+                            {"name": "run_workflow", "args": {"Description": "fanout"}},
+                            {"name": "swarm", "args": {"action": "status"}},
+                        ],
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:09Z",
+                        "content": "Post-edit read",
+                        "tool_calls": [
+                            {
+                                "name": read_tool,
+                                "args": {
+                                    path_key: target_path,
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            }
+                        ],
+                    },
+                    {"type": "GENERIC", "source": "MODEL", "content": "x" * 100},
+                ]
+
+            self._write_steps(
+                brain_legacy,
+                "legacy-1",
+                _make_steps(
+                    "view_file", "write_to_file", "replace_file_content", "TargetFile"
+                ),
+            )
+            self._write_steps(
+                brain_v2,
+                "v2-1",
+                _make_steps("read_file", "write_file", "edit_file", "Path"),
+            )
+
+            d_legacy = self._run_with_brain(
+                tmp_path / "l", brain_legacy, config_dir=tmp_path / "nocfg"
+            )
+            d_v2 = self._run_with_brain(
+                tmp_path / "v", brain_v2, config_dir=tmp_path / "nocfg"
+            )
+
+            for key in (
+                "file_views",
+                "unbounded_views",
+                "unbounded_view_pct",
+                "unbounded_view_tokens",
+                "bounded_view_tokens",
+                "file_view_overlap",
+                "write_to_file_modes",
+                "surgical_edits",
+                "surgical_edit_ratio_pct",
+                "total_tool_calls",
+            ):
+                self.assertEqual(d_legacy[key], d_v2[key], f"Parity mismatch on {key}")
+
+            self.assertEqual(d_v2["file_view_overlap"]["unmodified_overlap_pct"], 16.67)
+            self.assertEqual(d_v2["file_view_overlap"]["gross_overlap_pct"], 50.0)
+            self.assertEqual(
+                d_v2["write_to_file_modes"],
+                {"create": 1, "overwrite": 1, "append": 1},
+            )
+            self.assertEqual(d_v2["surgical_edits"], 1)
+            self.assertEqual(d_v2["surgical_edit_ratio_pct"], 50.0)
+            for t in ("call_mcp_tool", "invoke_subagent", "run_workflow", "swarm"):
+                self.assertEqual(d_v2["tool_call_counts"][t], 1)
+
+    def test_pretooluse_hook_denials_isolated_from_runtime_failures(self):
+        """PreToolUse denials are counted in hook_denials.by_guard and do not inflate runtime failures."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            self._write_steps(
+                brain,
+                "hook-conv",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Run checks</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:01Z",
+                        "content": "Calling tools",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "git status"},
+                            },
+                            {
+                                "name": "read_file",
+                                "args": {"Path": "/workspace/big.json"},
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "python3 missing.py"},
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "echo ok"},
+                            },
+                            {
+                                "name": "edit_file",
+                                "args": {"Path": "/workspace/a.py"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "content": "Encountered error in step execution: tool call denied by pre-tool hook: Git Worktree Boundary: outside repo",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "content": "Encountered error in step execution: tool call denied by pre-tool hook: Bounded Read Guard: file too large",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "content": "Command exited with code 1.\nTraceback (most recent call last):\nFileNotFoundError",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "content": "Command exited with code 0.\nok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "content": "Blocked by PreToolUse: Surgical Diff Guard: use edit_file",
+                    },
+                ],
+            )
+            data = self._run_with_brain(tmp_path, brain, config_dir=tmp_path / "nocfg")
+            # Only 2 commands actually executed (missing.py failed, echo ok succeeded); 1 hook-denied run_command excluded
+            self.assertEqual(data["commands"], 2)
+            self.assertEqual(data["failures"], 1)
+            self.assertEqual(data["failure_rate_pct"], 50.0)
+            self.assertEqual(data["hook_denials"]["total"], 3)
+            self.assertEqual(data["hook_denials"]["per_100_tool_calls"], 60.0)
+            self.assertEqual(
+                data["hook_denials"]["by_guard"],
+                {
+                    "Git Worktree Boundary": 1,
+                    "Bounded Read Guard": 1,
+                    "Surgical Diff Guard": 1,
+                },
+            )
+
+    def test_cache_drift_diagnostics(self):
+        """Compactions, mid-conversation model switches, long uncompacted sessions, and PreInvocation messages are counted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+
+            # Conv 1: initial model selection (not a switch) + 1 mid-conv switch + 2 compactions + 2 persistent PreInvocation messages
+            self._write_steps(
+                brain,
+                "drift-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Start</USER_REQUEST><USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from None to Gemini 4 Neon (Medium).</USER_SETTINGS_CHANGE>",
+                    },
+                    {
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM_SDK",
+                        "created_at": "2026-11-10T10:00:01Z",
+                        "content": "<SYSTEM_MESSAGE>\nThe following system message was injected by a PreInvocation hook:\n[CONTRACT DIARY: read ARCHITECTURE.md]\n</SYSTEM_MESSAGE>",
+                    },
+                    {
+                        "type": "CHECKPOINT",
+                        "source": "SYSTEM",
+                        "created_at": "2026-11-10T10:05:00Z",
+                        "content": "# Resuming from a compaction\nSummary 1",
+                    },
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:06:00Z",
+                        "content": "<USER_REQUEST>Switch model</USER_REQUEST><USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from Gemini 4 Neon (Medium) to Claude Opus 5.5 (High).</USER_SETTINGS_CHANGE>",
+                    },
+                    {
+                        "type": "SYSTEM_MESSAGE",
+                        "source": "SYSTEM_SDK",
+                        "created_at": "2026-11-10T10:06:01Z",
+                        "content": "<SYSTEM_MESSAGE>\n[ZERO-SLASH MANDATE: Active skill triggers detected]\n</SYSTEM_MESSAGE>",
+                    },
+                    {
+                        "type": "CHECKPOINT",
+                        "source": "SYSTEM",
+                        "created_at": "2026-11-10T10:10:00Z",
+                        "content": "# Resuming from a compaction\nSummary 2",
+                    },
+                ],
+            )
+            # Conv 2: 16 user turns with 0 compactions -> counted in long_convs_without_compaction
+            long_steps = [
+                {
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "created_at": f"2026-11-10T11:{i:02d}:00Z",
+                    "content": f"<USER_REQUEST>Turn {i}</USER_REQUEST>",
+                }
+                for i in range(16)
+            ]
+            self._write_steps(brain, "drift-long", long_steps)
+
+            data = self._run_with_brain(tmp_path, brain, config_dir=tmp_path / "nocfg")
+            diag = data["cache_drift_diagnostics"]
+            self.assertEqual(diag["compactions_total"], 2)
+            self.assertEqual(diag["convs_with_compaction"], 1)
+            self.assertEqual(diag["long_convs_without_compaction"], 1)
+            self.assertEqual(diag["model_switches_total"], 1)
+            self.assertEqual(diag["convs_with_model_switch"], 1)
+            self.assertEqual(diag["persistent_hook_system_messages"]["count"], 2)
+            self.assertGreater(diag["persistent_hook_system_messages"]["tokens"], 0)
+
+    def test_four_channel_customization_attribution_zero_truncation_and_excludes_audit(
+        self,
+    ):
+        """All 4 channels (skill_read, cli_or_script, mcp, agent) are attributed with zero truncation and audit sessions excluded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            cfg = tmp_path / "config"
+            cfg.mkdir()
+
+            # Configure installed plugins, MCP servers, 30 standalone skills, and custom/plugin agents
+            (cfg / "config.json").write_text(
+                json.dumps(
+                    {
+                        "plugins": {
+                            "gdocs": {"enabled": True},
+                            "gsheets": {"enabled": True},
+                            "gdrive": {"enabled": True},
+                            "firebase": {"enabled": True},
+                            "unused-plugin": {"enabled": False},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (cfg / "mcp_config.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "firebase-mcp-server": {},
+                            "medical-terminology": {},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (cfg / "plugins" / "firebase" / "agents").mkdir(parents=True)
+            (
+                cfg / "plugins" / "firebase" / "agents" / "firestore-rules-author.md"
+            ).write_text("# agent", encoding="utf-8")
+            (cfg / "agents").mkdir(parents=True)
+            (cfg / "agents" / "code-auditor.md").write_text("# agent", encoding="utf-8")
+            for idx in range(1, 31):
+                sdir = cfg / "skills" / f"skill-{idx:02d}"
+                sdir.mkdir(parents=True)
+                (sdir / "SKILL.md").write_text(f"# skill {idx}", encoding="utf-8")
+
+            # Normal interactive session exercising all 4 channels + 30 distinct skills (beyond top-25)
+            skill_read_calls = [
+                {
+                    "name": "read_file",
+                    "args": {
+                        "Path": f"/fake-home/.gemini/config/skills/skill-{idx:02d}/SKILL.md",
+                        "StartLine": 1,
+                        "EndLine": 10,
+                    },
+                }
+                for idx in range(1, 31)
+            ]
+            self._write_steps(
+                brain,
+                "work-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Use docs, sheets, drive, firebase, skills</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:02Z",
+                        "content": "Executing",
+                        "tool_calls": [
+                            *skill_read_calls,
+                            {
+                                "name": "run_command",
+                                "args": {
+                                    "CommandLine": "AGY_ACCOUNT=work gdocs read 123"
+                                },
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {
+                                    "CommandLine": "gsheets get abc && gdrive list"
+                                },
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {
+                                    "CommandLine": "python3 /fake-home/.gemini/config/skills/skill-30/scripts/run.py"
+                                },
+                            },
+                            {
+                                "name": "call_mcp_tool",
+                                "args": {
+                                    "ServerName": "firebase-mcp-server",
+                                    "ToolName": "firebase_list_projects",
+                                },
+                            },
+                            {
+                                "name": "call_mcp_tool",
+                                "args": {
+                                    "ServerName": "medical-terminology",
+                                    "ToolName": "icd10_search",
+                                },
+                            },
+                            {
+                                "name": "invoke_subagent",
+                                "args": {
+                                    "TypeName": "firestore-rules-author",
+                                    "Prompt": "write rules",
+                                },
+                            },
+                            {
+                                "name": "invoke_subagent",
+                                "args": {
+                                    "TypeName": "code-auditor",
+                                    "Prompt": "audit",
+                                },
+                            },
+                        ],
+                    },
+                ],
+            )
+            # Audit session that MUST be excluded from customization_usage by default
+            self._write_steps(
+                brain,
+                "audit-meta",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T12:00:00Z",
+                        "content": "<USER_REQUEST>/improve-agent-efficiency check</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T12:00:02Z",
+                        "content": "Running",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "gdocs list"},
+                            }
+                        ],
+                    },
+                ],
+            )
+
+            data = self._run_with_brain(tmp_path, brain, config_dir=cfg)
+            cu = data["customization_usage"]
+            # CLI-backed plugins attributed accurately (audit session excluded -> gdocs == 1, not 2)
+            self.assertEqual(cu["plugins"]["gdocs"]["cli_or_script"], 1)
+            self.assertEqual(cu["plugins"]["gdocs"]["total"], 1)
+            self.assertEqual(cu["plugins"]["gsheets"]["cli_or_script"], 1)
+            self.assertEqual(cu["plugins"]["gdrive"]["cli_or_script"], 1)
+            # Plugin-owned MCP server + plugin-bundled agent both attributed to firebase plugin
+            self.assertEqual(cu["plugins"]["firebase"]["mcp"], 1)
+            self.assertEqual(cu["plugins"]["firebase"]["agent"], 1)
+            self.assertEqual(cu["plugins"]["firebase"]["total"], 2)
+            self.assertEqual(cu["plugins"]["unused-plugin"]["total"], 0)
+            self.assertFalse(cu["plugins"]["unused-plugin"]["enabled"])
+            # Zero top-25 truncation: all 30 skills present, and skill-30 has both skill_read + cli_or_script
+            self.assertEqual(len(cu["skills"]), 30)
+            self.assertEqual(cu["skills"]["skill-30"]["skill_read"], 1)
+            self.assertEqual(cu["skills"]["skill-30"]["cli_or_script"], 1)
+            self.assertEqual(cu["skills"]["skill-30"]["total"], 2)
+            # MCP & Agents
+            self.assertEqual(cu["mcp_servers"]["firebase-mcp-server"]["mcp"], 1)
+            self.assertEqual(cu["mcp_servers"]["medical-terminology"]["mcp"], 1)
+            self.assertEqual(cu["agents"]["firestore-rules-author"]["agent"], 1)
+            self.assertEqual(cu["agents"]["code-auditor"]["agent"], 1)
+
+    def test_api_ground_truth_exact_aggregation_without_double_counting(self):
+        """API ground-truth tokens (input, cache_creation, cache_read, output, cache_hit_rate_pct) match exact math."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+
+            self._write_steps(
+                brain,
+                "gt-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "<USER_REQUEST>Task 1</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:05Z",
+                        "content": "Answer 1",
+                        "input_tokens": 1000,
+                        "cache_creation_input_tokens": 500,
+                        "cache_read_tokens": 8500,
+                        "output_tokens": 400,
+                    },
+                ],
+            )
+            self._write_steps(
+                brain,
+                "gt-2",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-10T11:00:00Z",
+                        "content": "<USER_REQUEST>Task 2</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T11:00:05Z",
+                        "content": "Answer 2",
+                        "input_tokens": 500,
+                        "cache_read_tokens": 9500,
+                        "output_tokens": 600,
+                    },
+                ],
+            )
+
+            data = self._run_with_brain(tmp_path, brain, config_dir=tmp_path / "nocfg")
+            gt = data["api_tokens_ground_truth"]
+            self.assertTrue(gt["has_ground_truth"])
+            # Fresh input = (1000 + 500) + 500 = 2000 (no double-counting!)
+            self.assertEqual(gt["input_tokens_fresh"], 2000)
+            self.assertEqual(gt["cache_creation_input_tokens"], 500)
+            # Cache read = 8500 + 9500 = 18000
+            self.assertEqual(gt["cache_read_tokens"], 18000)
+            # Output = 400 + 600 = 1000
+            self.assertEqual(gt["output_tokens_model"], 1000)
+            # Context = 2000 + 18000 = 20000; Total all = 21000
+            self.assertEqual(gt["total_api_context_processed"], 20000)
+            self.assertEqual(gt["total_api_tokens_all"], 21000)
+            self.assertEqual(gt["fresh_input_per_conv"], 1000)
+            self.assertEqual(gt["cache_read_per_conv"], 9000)
+            self.assertEqual(gt["output_per_conv"], 500)
+            self.assertEqual(gt["context_per_conv"], 10000)
+            self.assertEqual(gt["total_api_per_conv"], 10500)
+            # Cache hit rate = 18000 / 20000 * 100 = 90.0%
+            self.assertEqual(gt["cache_hit_rate_pct"], 90.0)
+
+    def test_pr4_hardening_regressions(self):
+        """Regression tests for PR #4 review findings (denial envelope, quoting, epoch, settings, manifests, quotas)."""
+        # 1. Quote-aware command segmentation
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                'rg "foo|firebase|gdocs" src/ && gdocs list | jq .'
+            ),
+            ["rg", "gdocs", "jq"],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                "python3 -c 'import os; gdocs = 1; firebase = 2'"
+            ),
+            ["python3"],
+        )
+
+        # 2. Hook denial envelope ignores executed command output & DONE status
+        self.assertIsNone(
+            audit_trajectories.extract_hook_denial_guard(
+                "Command exited with code 1.\n\nCommand output:\nBlocked by PreToolUse: Bounded Read Guard"
+            )
+        )
+        self.assertIsNone(
+            audit_trajectories.extract_hook_denial_guard(
+                {
+                    "status": "DONE",
+                    "content": "Blocked by PreToolUse: Bounded Read Guard",
+                }
+            )
+        )
+        self.assertEqual(
+            audit_trajectories.extract_hook_denial_guard(
+                {
+                    "status": "ERROR",
+                    "content": "Encountered error in step execution: tool call denied by pre-tool hook: Bounded Read Guard: too large",
+                }
+            ),
+            "Bounded Read Guard",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            cfg = tmp_path / "cfg"
+
+            # 3. Malformed non-dict plugin.json is skipped without crashing
+            bad_pdir = cfg / "plugins" / "bad-plugin"
+            bad_pdir.mkdir(parents=True)
+            (bad_pdir / "plugin.json").write_text(
+                '["not", "a", "dict"]', encoding="utf-8"
+            )
+            good_pdir = cfg / "plugins" / "good-plugin"
+            good_pdir.mkdir(parents=True)
+            (good_pdir / "plugin.json").write_text(
+                '{"disabled": false}', encoding="utf-8"
+            )
+
+            # 4. Denied edit preserves file_lines_read_epoch; prose model-switch ignored;
+            #    command output quoting hook denial still counted as failure.
+            self._write_steps(
+                brain,
+                "interactive-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-12T10:00:00Z",
+                        "content": (
+                            "<USER_REQUEST>User prose: changed setting `Model Selection` from Alpha to Beta.</USER_REQUEST>"
+                            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from None to ModelA.</USER_SETTINGS_CHANGE>"
+                        ),
+                    },
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-12T10:01:00Z",
+                        "content": (
+                            "<USER_REQUEST>Switch now</USER_REQUEST>"
+                            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from ModelA to ModelB.</USER_SETTINGS_CHANGE>"
+                        ),
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-12T10:02:00Z",
+                        "content": "Read, denied edit, re-read, and failing command quoting denial",
+                        "tool_calls": [
+                            {
+                                "name": "read_file",
+                                "args": {
+                                    "Path": "/ws/a.py",
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "name": "edit_file",
+                                "args": {"Path": "/ws/a.py", "Replacement": "x"},
+                            },
+                            {
+                                "name": "read_file",
+                                "args": {
+                                    "Path": "/ws/a.py",
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "python3 fail.py"},
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": '"echo" "notes; gdrive list"'},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Surgical Diff Guard: denied",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Command exited with code 1.\nBlocked by PreToolUse: Bounded Read Guard",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Command exited with code 0.\nnotes; gdrive list",
+                    },
+                ],
+            )
+            # Older interactive conv (exceeds limit=1) and older headless conv (must still be collected!)
+            self._write_steps(
+                brain,
+                "interactive-2-older",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-11T10:00:00Z",
+                        "content": "<USER_REQUEST>Older interactive</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-11T10:00:05Z",
+                        "content": "Done",
+                        "input_tokens": 9999,
+                    },
+                ],
+            )
+            self._write_steps(
+                brain,
+                "headless-oldest",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "Subagent run",
+                        "input_tokens": 700,
+                        "output_tokens": 50,
+                    }
+                ],
+            )
+
+            data = self._run_with_brain(
+                tmp_path / "run1", brain, config_dir=cfg, max_conversations=1
+            )
+            # Malformed plugin skipped, valid plugin discovered
+            self.assertNotIn("bad-plugin", data["customization_usage"]["plugins"])
+            self.assertIn("good-plugin", data["customization_usage"]["plugins"])
+            # Only 1 genuine mid-conv model switch (prose in USER_REQUEST ignored)
+            self.assertEqual(data["cache_drift_diagnostics"]["model_switches_total"], 1)
+            # Denied edit did NOT reset epoch: 10 lines read twice -> 50% unmodified overlap
+            self.assertEqual(data["file_view_overlap"]["unmodified_overlap_pct"], 50.0)
+            # Command quoting "Blocked by PreToolUse" still counted as failure, not denial;
+            # '"echo" "notes; gdrive list"' succeeds without falsely crediting gdrive
+            self.assertEqual(data["commands"], 2)
+            self.assertEqual(data["failures"], 1)
+            self.assertEqual(
+                data["customization_usage"]["plugins"]
+                .get("gdrive", {})
+                .get("cli_or_script", 0),
+                0,
+            )
+            self.assertEqual(data["hook_denials"]["total"], 1)
+            self.assertEqual(
+                data["hook_denials"]["by_guard"], {"Surgical Diff Guard": 1}
+            )
+            # Primary capped at 1 interactive, but older headless still collected
+            self.assertEqual(data["conversations"], 1)
+            self.assertEqual(data["interactive_conversations"], 1)
+            self.assertEqual(data["subagent_or_headless_conversations"], 1)
+            self.assertEqual(data["total_api_tokens_including_subagents"], 750)
+
+            # 5. Explicit --conv headless IDs are subject to max_conversations
+            self._write_steps(
+                brain,
+                "headless-second",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T11:00:00Z",
+                        "content": "Subagent 2",
+                        "input_tokens": 300,
+                    }
+                ],
+            )
+            conv_limited = self._run_with_brain(
+                tmp_path / "run2",
+                brain,
+                config_dir=cfg,
+                include_conv="headless-oldest,headless-second",
+                max_conversations=1,
+            )
+            self.assertEqual(conv_limited["conversations"], 1)
+            self.assertEqual(conv_limited["subagent_or_headless_conversations"], 1)
+
+            # 6. --include-subagents + --limit still collects older headless sessions
+            #    in both standard mode and --compare mode
+            incl_std = self._run_with_brain(
+                tmp_path / "run3",
+                brain,
+                config_dir=cfg,
+                include_subagents=True,
+                max_conversations=1,
+            )
+            # Primary sample capped at 1 (newest interactive-1), while both older headless sessions are collected
+            self.assertEqual(incl_std["conversations"], 1)
+            self.assertEqual(incl_std["subagent_or_headless_conversations"], 2)
+            self.assertEqual(incl_std["subagent_summary"]["conversations"], 2)
+            self.assertEqual(incl_std["total_api_tokens_including_subagents"], 1050)
+
+            # Add an older target-window headless session (after 2026-11-12T00:00:00Z)
+            self._write_steps(
+                brain,
+                "headless-target-older",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-12T08:00:00Z",
+                        "content": "Target subagent",
+                        "input_tokens": 200,
+                    }
+                ],
+            )
+            incl_cmp = self._run_with_brain(
+                tmp_path / "run4",
+                brain,
+                config_dir=cfg,
+                since_date="2026-11-12",
+                compare_mode=True,
+                include_subagents=True,
+                max_conversations=1,
+            )
+            cmp_block = incl_cmp["comparison"]
+            self.assertEqual(cmp_block["target_window"]["conversations"], 1)
+            self.assertEqual(cmp_block["baseline_window"]["conversations"], 1)
+            self.assertEqual(cmp_block["target_subagent_summary"]["conversations"], 1)
+            self.assertEqual(cmp_block["baseline_subagent_summary"]["conversations"], 2)
+            self.assertEqual(
+                cmp_block["target_total_api_tokens_including_subagents"], 200
+            )
+            self.assertEqual(
+                cmp_block["baseline_total_api_tokens_including_subagents"],
+                9999 + 1050,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
