@@ -27,6 +27,8 @@ Run [`scripts/audit_trajectories.py`](scripts/audit_trajectories.py) with `--sin
 4. **Prompt Cache & API Ground Truth:** Elevate `api_tokens_ground_truth` (`cache_hit_rate_pct`, `fresh_input_per_conv`, `total_api_per_conv`) and its per-conversation calibration spread as primary cost truth.
 5. **Prefer Full Transcripts:** Always inspect `transcript_full.jsonl` over `transcript.jsonl` to avoid truncated tool outputs (`"truncated_fields": ["content"]`).
 6. **Benign Non-Zero Exits:** Zero-match searches (`rg`, `grep`, `findstr`, `diff` exit 1), TDD red-phase test runs, and pending `gh pr checks` (exit 8) are normal workflow signals, not command failures.
+7. **Complete 4-Channel Customization Attribution:** Never declare a plugin, skill, MCP server, or subagent "unused" from a single channel or a top-N truncated list. Always inspect `customization_usage` across all 4 attribution channels (`skill_read`, `cli_or_script`, `mcp`, `agent`) with zero truncation and audit sessions excluded so CLI-backed plugins (`gdocs`, `gsheets`, `gdrive`, `coderabbit`, `firebase`, `9arm-skills`), plugin-owned MCP servers/agents, and low-frequency skills are accurately credited.
+8. **Interactive vs Subagent Cohort Separation & Hook Denial Isolation:** Keep primary per-conversation metrics (`median_turns_per_conv`, `turns_per_conv`, token averages) and conversation-level bootstrap significance tests scoped to interactive sessions (`user_turns >= 1`) while inspecting `subagent_summary` and `total_api_tokens_including_subagents` for headless/spawned-agent spend. Evaluate `PreToolUse` guard blocks via `hook_denials` (`total`, `per_100_tool_calls`, `by_guard`) separately from true runtime `failures`.
 
 For the complete JSON output schema and statistical formulas, read [`references/metrics_and_schema.md`](references/metrics_and_schema.md).
 
@@ -99,6 +101,7 @@ py -3.10 "<SkillDir>\scripts\audit_trajectories.py" "<ScratchDir>" --since <YYYY
 - `--repo <keyword>` / `--exclude <name1,name2>` / `--exclude-conv <id1,id2>`: Filter by repository or conversation ID (applied before `--limit`).
 - `--limit <N>` (default `100`) / `--all`: Cap evaluated conversations after repo filtering, or parse all sessions.
 - `--include-audit-sessions`: Include meta/audit sessions (excluded by default).
+- `--include-subagents`: Include subagent/headless sessions (`user_turns == 0`) in primary cohort metrics (default: separated into `subagent_summary` while keeping `total_api_tokens_including_subagents` intact).
 - `--inventory-only`: Fast repository and date boundary discovery without parsing full transcripts.
 - `--print-summary`: Stream structured JSON summary to stdout.
 
