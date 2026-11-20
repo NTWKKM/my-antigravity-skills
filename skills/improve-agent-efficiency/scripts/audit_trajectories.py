@@ -1040,6 +1040,7 @@ def parse_conversations(
     baseline_count = 0
     primary_count = 0
     headless_in_primary = bool(include_subagents or include_conv_set)
+    stop_when_quota_full = bool(include_conv_set)
 
     for mtime, item, tpath, conv_dt in conv_candidates:
         primary_quota_full = False
@@ -1049,20 +1050,20 @@ def parse_conversations(
                     target_count >= max_conversations
                     and baseline_count >= max_conversations
                 ):
-                    if headless_in_primary:
+                    if stop_when_quota_full:
                         break
                     primary_quota_full = True
                 elif conv_dt >= since_dt and target_count >= max_conversations:
-                    if headless_in_primary:
+                    if stop_when_quota_full:
                         continue
                     primary_quota_full = True
                 elif conv_dt < since_dt and baseline_count >= max_conversations:
-                    if headless_in_primary:
+                    if stop_when_quota_full:
                         continue
                     primary_quota_full = True
             else:
                 if primary_count >= max_conversations:
-                    if headless_in_primary:
+                    if stop_when_quota_full:
                         break
                     primary_quota_full = True
         first_prompt = ""
@@ -1117,7 +1118,7 @@ def parse_conversations(
         except Exception:
             continue
 
-        if primary_quota_full and not headless_in_primary:
+        if primary_quota_full and not stop_when_quota_full:
             if any(
                 s.get("type", "") == "USER_INPUT"
                 or s.get("source", "") == "USER_EXPLICIT"
@@ -1801,7 +1802,7 @@ def parse_conversations(
             }
         )
         is_counted_conv = headless_in_primary or (session_type == "interactive")
-        if is_counted_conv:
+        if is_counted_conv and not primary_quota_full:
             primary_count += 1
             if compare_mode and since_dt:
                 if conv_dt >= since_dt:
@@ -3163,6 +3164,8 @@ def run_audit(
             if (include_subagents or include_conv_list)
             else interactive_convs_all
         )
+        if max_conversations and max_conversations > 0:
+            primary_convs = primary_convs[:max_conversations]
         summary = calculate_cohort_summary(
             primary_convs, installed_customizations=installed_customizations
         )

@@ -2080,6 +2080,57 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(conv_limited["conversations"], 1)
             self.assertEqual(conv_limited["subagent_or_headless_conversations"], 1)
 
+            # 6. --include-subagents + --limit still collects older headless sessions
+            #    in both standard mode and --compare mode
+            incl_std = self._run_with_brain(
+                tmp_path / "run3",
+                brain,
+                config_dir=cfg,
+                include_subagents=True,
+                max_conversations=1,
+            )
+            # Primary sample capped at 1 (newest interactive-1), while both older headless sessions are collected
+            self.assertEqual(incl_std["conversations"], 1)
+            self.assertEqual(incl_std["subagent_or_headless_conversations"], 2)
+            self.assertEqual(incl_std["subagent_summary"]["conversations"], 2)
+            self.assertEqual(incl_std["total_api_tokens_including_subagents"], 1050)
+
+            # Add an older target-window headless session (after 2026-11-12T00:00:00Z)
+            self._write_steps(
+                brain,
+                "headless-target-older",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-12T08:00:00Z",
+                        "content": "Target subagent",
+                        "input_tokens": 200,
+                    }
+                ],
+            )
+            incl_cmp = self._run_with_brain(
+                tmp_path / "run4",
+                brain,
+                config_dir=cfg,
+                since_date="2026-11-12",
+                compare_mode=True,
+                include_subagents=True,
+                max_conversations=1,
+            )
+            cmp_block = incl_cmp["comparison"]
+            self.assertEqual(cmp_block["target_window"]["conversations"], 1)
+            self.assertEqual(cmp_block["baseline_window"]["conversations"], 1)
+            self.assertEqual(cmp_block["target_subagent_summary"]["conversations"], 1)
+            self.assertEqual(cmp_block["baseline_subagent_summary"]["conversations"], 2)
+            self.assertEqual(
+                cmp_block["target_total_api_tokens_including_subagents"], 200
+            )
+            self.assertEqual(
+                cmp_block["baseline_total_api_tokens_including_subagents"],
+                9999 + 1050,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
