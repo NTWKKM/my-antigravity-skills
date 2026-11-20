@@ -301,6 +301,10 @@ MODEL_CHANGE_RE = re.compile(
 MODEL_SWITCH_RE = re.compile(
     r"changed setting `Model Selection` from ([^\n]*?) to ([^\n<]+?)\.(?:\s|<|$)"
 )
+USER_REQUEST_BLOCK_RE = re.compile(r"<USER_REQUEST>.*?</USER_REQUEST>", re.DOTALL)
+USER_SETTINGS_CHANGE_RE = re.compile(
+    r"<USER_SETTINGS_CHANGE>(.*?)</USER_SETTINGS_CHANGE>", re.DOTALL
+)
 
 READ_TOOLS = frozenset({"read_file", "view_file"})
 WRITE_TOOLS = frozenset({"write_file", "write_to_file"})
@@ -312,6 +316,15 @@ FILE_MODIFY_TOOLS = WRITE_TOOLS | EDIT_TOOLS
 HOOK_DENIAL_MARKERS = (
     "tool call denied by pre-tool hook",
     "blocked by pretooluse",
+)
+HOOK_DENIAL_ENVELOPE_RE = re.compile(
+    r"^\s*(?:(?:encountered error in step execution|error|tool execution error|hook denied)\s*:\s*)?"
+    r"(?:tool call denied by pre-tool hook|blocked by pretooluse)\b",
+    re.IGNORECASE,
+)
+CMD_EXECUTION_HEADER_RE = re.compile(
+    r"(?:^|\n)\s*Command\s+(?:exited with code\s+-?\d+|finished with result:)",
+    re.IGNORECASE,
 )
 
 PERSISTENT_SYS_MSG_MARKERS = (
@@ -353,22 +366,28 @@ ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 CMD_WRAPPERS = frozenset({"env", "sudo", "npx", "pnpm", "yarn", "uv", "time", "nohup"})
 
 
-def extract_hook_denial_guard(text):
-    """Return the PreToolUse guard name if text represents a hook denial, else None."""
+def extract_hook_denial_guard(text_or_step, status=None):
+    """Return the PreToolUse guard name if a tool-result step/envelope represents a hook denial, else None."""
+    if isinstance(text_or_step, dict):
+        status = text_or_step.get("status") if status is None else status
+        text = text_or_step.get("content", "") or ""
+    else:
+        text = text_or_step
     if not text or not isinstance(text, str):
         return None
-    low = text.lower()
-    marker_pos = -1
-    marker_len = 0
-    for marker in HOOK_DENIAL_MARKERS:
-        idx = low.find(marker)
-        if idx != -1:
-            marker_pos = idx
-            marker_len = len(marker)
-            break
-    if marker_pos == -1:
+    if isinstance(status, str) and status.strip().upper() in (
+        "DONE",
+        "SUCCESS",
+        "SUCCEEDED",
+        "OK",
+    ):
         return None
-    remainder = text[marker_pos + marker_len :].lstrip(" :\t-")
+    if CMD_EXECUTION_HEADER_RE.search(text):
+        return None
+    m = HOOK_DENIAL_ENVELOPE_RE.match(text)
+    if not m:
+        return None
+    remainder = text[m.end() :].lstrip(" :\t-")
     first_line = remainder.splitlines()[0].strip() if remainder else ""
     if not first_line:
         return "Unknown Guard"
@@ -379,13 +398,62 @@ def extract_hook_denial_guard(text):
     return first_line[:64].strip() or "Unknown Guard"
 
 
+def _split_shell_segments(cmd_str):
+    """Split a shell command string on unquoted control operators (&&, ||, ;, |, newline)."""
+    segments = []
+    buf = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            buf.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if cmd_str[i : i + 2] in ("&&", "||"):
+                segments.append("".join(buf))
+                buf = []
+                i += 2
+                continue
+            if ch in (";", "|", "\n"):
+                segments.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        segments.append("".join(buf))
+    return segments
+
+
 def extract_command_executables(cmd_str):
     """Extract executable basenames invoked across shell command segments."""
     if not cmd_str or not isinstance(cmd_str, str):
         return []
     cleaned = HEREDOC_BODY_RE.sub("", cmd_str)
     executables = []
-    for segment in CMD_SEGMENT_SPLIT_RE.split(cleaned):
+    for segment in _split_shell_segments(cleaned):
         tokens = segment.strip().split()
         idx = 0
         while idx < len(tokens):
@@ -454,11 +522,14 @@ def discover_installed_customizations(config_dir=None):
             pj = pdir / "plugin.json"
             if pj.exists():
                 try:
-                    pj_data = json.loads(
+                    decoded = json.loads(
                         pj.read_text(encoding="utf-8", errors="ignore")
                     )
                 except Exception:
-                    pj_data = {}
+                    decoded = {}
+                if not isinstance(decoded, dict):
+                    continue
+                pj_data = decoded
             if pname not in plugins:
                 plugins[pname] = {"enabled": not bool(pj_data.get("disabled", False))}
 
@@ -967,24 +1038,33 @@ def parse_conversations(
     total_candidates = len(conv_candidates)
     target_count = 0
     baseline_count = 0
-    interactive_count = 0
+    primary_count = 0
+    headless_in_primary = bool(include_subagents or include_conv_set)
 
     for mtime, item, tpath, conv_dt in conv_candidates:
+        primary_quota_full = False
         if max_conversations and max_conversations > 0:
             if compare_mode and since_dt:
                 if (
                     target_count >= max_conversations
                     and baseline_count >= max_conversations
                 ):
-                    break
-                if conv_dt >= since_dt and target_count >= max_conversations:
-                    continue
-                if conv_dt < since_dt and baseline_count >= max_conversations:
-                    continue
+                    if headless_in_primary:
+                        break
+                    primary_quota_full = True
+                elif conv_dt >= since_dt and target_count >= max_conversations:
+                    if headless_in_primary:
+                        continue
+                    primary_quota_full = True
+                elif conv_dt < since_dt and baseline_count >= max_conversations:
+                    if headless_in_primary:
+                        continue
+                    primary_quota_full = True
             else:
-                counted = len(conversations) if include_subagents else interactive_count
-                if counted >= max_conversations:
-                    break
+                if primary_count >= max_conversations:
+                    if headless_in_primary:
+                        break
+                    primary_quota_full = True
         first_prompt = ""
         user_prompts = []
         active_ws = ""
@@ -1037,6 +1117,14 @@ def parse_conversations(
         except Exception:
             continue
 
+        if primary_quota_full and not headless_in_primary:
+            if any(
+                s.get("type", "") == "USER_INPUT"
+                or s.get("source", "") == "USER_EXPLICIT"
+                for s in steps
+            ):
+                continue
+
         for i, step in enumerate(steps):
             st = step.get("type", "")
             source = step.get("source", "")
@@ -1063,17 +1151,23 @@ def parse_conversations(
             if (
                 st in ("USER_INPUT", "SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE")
                 or source in ("USER_EXPLICIT", "SYSTEM", "SYSTEM_SDK")
-            ) and "Model Selection" in content:
-                for from_m, to_m in MODEL_SWITCH_RE.findall(content):
-                    from_clean = from_m.strip()
-                    to_clean = to_m.strip()
-                    if not to_clean:
-                        continue
-                    if (from_clean.lower() != "none" and from_clean != to_clean) or (
-                        seen_models_in_conv and to_clean != seen_models_in_conv[-1]
-                    ):
-                        model_switches_count += 1
-                    seen_models_in_conv.append(to_clean)
+            ) and "<USER_SETTINGS_CHANGE>" in content:
+                non_request_content = USER_REQUEST_BLOCK_RE.sub("", content)
+                for settings_block in USER_SETTINGS_CHANGE_RE.findall(
+                    non_request_content
+                ):
+                    for from_m, to_m in MODEL_SWITCH_RE.findall(settings_block):
+                        from_clean = from_m.strip()
+                        to_clean = to_m.strip()
+                        if not to_clean:
+                            continue
+                        if (
+                            from_clean.lower() != "none" and from_clean != to_clean
+                        ) or (
+                            seen_models_in_conv and to_clean != seen_models_in_conv[-1]
+                        ):
+                            model_switches_count += 1
+                        seen_models_in_conv.append(to_clean)
 
             if st == "USER_INPUT" or source == "USER_EXPLICIT":
                 user_turns_count += 1
@@ -1243,6 +1337,15 @@ def parse_conversations(
                                     )
 
                 if tname in FILE_MODIFY_TOOLS:
+                    if tc_idx < len(tool_result_steps):
+                        edit_denial_g = extract_hook_denial_guard(
+                            tool_result_steps[tc_idx]
+                        )
+                        if edit_denial_g is not None:
+                            if tc_idx not in counted_denial_step_ids:
+                                counted_denial_step_ids.add(tc_idx)
+                                hook_denials_by_guard[edit_denial_g] += 1
+                            continue
                     target_f = clean_str(
                         args.get("Path")
                         or args.get("TargetFile")
@@ -1352,7 +1455,7 @@ def parse_conversations(
                         if r_idx in used_cmd_step_ids:
                             continue
                         m_content = r_step.get("content", "") or ""
-                        denial_g = extract_hook_denial_guard(m_content)
+                        denial_g = extract_hook_denial_guard(r_step)
                         if (
                             "exited with code" in m_content
                             or "finished with result:" in m_content
@@ -1457,7 +1560,7 @@ def parse_conversations(
             for r_idx, r_step in enumerate(tool_result_steps):
                 if r_idx in counted_denial_step_ids:
                     continue
-                denial_g = extract_hook_denial_guard(r_step.get("content", "") or "")
+                denial_g = extract_hook_denial_guard(r_step)
                 if denial_g is not None:
                     counted_denial_step_ids.add(r_idx)
                     hook_denials_by_guard[denial_g] += 1
@@ -1697,10 +1800,9 @@ def parse_conversations(
                 "model": model_changes[-1] if model_changes else "unknown",
             }
         )
-        is_counted_conv = include_subagents or (session_type == "interactive")
+        is_counted_conv = headless_in_primary or (session_type == "interactive")
         if is_counted_conv:
-            if session_type == "interactive":
-                interactive_count += 1
+            primary_count += 1
             if compare_mode and since_dt:
                 if conv_dt >= since_dt:
                     target_count += 1
@@ -2936,10 +3038,20 @@ def run_audit(
             val_suffix="%",
             is_significant=sig_cache,
         )
+        b_api_ctx = (
+            base_api["context_per_conv"]
+            if base_api.get("context_per_conv") is not None
+            else base_api.get("total_api_per_conv")
+        )
+        t_api_ctx = (
+            tgt_api["context_per_conv"]
+            if tgt_api.get("context_per_conv") is not None
+            else tgt_api.get("total_api_per_conv")
+        )
         print_row(
             "API Context / Conv (Ground Truth)",
-            base_api.get("context_per_conv") or base_api.get("total_api_per_conv"),
-            tgt_api.get("context_per_conv") or tgt_api.get("total_api_per_conv"),
+            b_api_ctx,
+            t_api_ctx,
             lower_is_better=True,
             is_significant=sig_api_context,
         )
@@ -3058,8 +3170,9 @@ def run_audit(
             subagent_convs_all, installed_customizations=installed_customizations
         )
         print(
-            f"\nParsed Active Conversations: {summary['conversations']} interactive "
-            f"(+ {len(subagent_convs_all)} subagent/headless, out of {total_candidates} matching candidates)"
+            f"\nParsed Active Conversations: {len(interactive_convs_all)} interactive "
+            f"(+ {len(subagent_convs_all)} subagent/headless, {summary['conversations']} in primary summary, "
+            f"out of {total_candidates} matching candidates)"
         )
         print(f"Total Commands Executed: {summary['commands']}")
         print(

@@ -1444,6 +1444,8 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             ):
                 self.assertEqual(d_legacy[key], d_v2[key], f"Parity mismatch on {key}")
 
+            self.assertEqual(d_v2["file_view_overlap"]["unmodified_overlap_pct"], 16.67)
+            self.assertEqual(d_v2["file_view_overlap"]["gross_overlap_pct"], 50.0)
             self.assertEqual(
                 d_v2["write_to_file_modes"],
                 {"create": 1, "overwrite": 1, "append": 1},
@@ -1856,6 +1858,227 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(gt["total_api_per_conv"], 10500)
             # Cache hit rate = 18000 / 20000 * 100 = 90.0%
             self.assertEqual(gt["cache_hit_rate_pct"], 90.0)
+
+    def test_pr4_hardening_regressions(self):
+        """Regression tests for PR #4 review findings (denial envelope, quoting, epoch, settings, manifests, quotas)."""
+        # 1. Quote-aware command segmentation
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                'rg "foo|firebase|gdocs" src/ && gdocs list | jq .'
+            ),
+            ["rg", "gdocs", "jq"],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                "python3 -c 'import os; gdocs = 1; firebase = 2'"
+            ),
+            ["python3"],
+        )
+
+        # 2. Hook denial envelope ignores executed command output & DONE status
+        self.assertIsNone(
+            audit_trajectories.extract_hook_denial_guard(
+                "Command exited with code 1.\n\nCommand output:\nBlocked by PreToolUse: Bounded Read Guard"
+            )
+        )
+        self.assertIsNone(
+            audit_trajectories.extract_hook_denial_guard(
+                {
+                    "status": "DONE",
+                    "content": "Blocked by PreToolUse: Bounded Read Guard",
+                }
+            )
+        )
+        self.assertEqual(
+            audit_trajectories.extract_hook_denial_guard(
+                {
+                    "status": "ERROR",
+                    "content": "Encountered error in step execution: tool call denied by pre-tool hook: Bounded Read Guard: too large",
+                }
+            ),
+            "Bounded Read Guard",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            cfg = tmp_path / "cfg"
+
+            # 3. Malformed non-dict plugin.json is skipped without crashing
+            bad_pdir = cfg / "plugins" / "bad-plugin"
+            bad_pdir.mkdir(parents=True)
+            (bad_pdir / "plugin.json").write_text(
+                '["not", "a", "dict"]', encoding="utf-8"
+            )
+            good_pdir = cfg / "plugins" / "good-plugin"
+            good_pdir.mkdir(parents=True)
+            (good_pdir / "plugin.json").write_text(
+                '{"disabled": false}', encoding="utf-8"
+            )
+
+            # 4. Denied edit preserves file_lines_read_epoch; prose model-switch ignored;
+            #    command output quoting hook denial still counted as failure.
+            self._write_steps(
+                brain,
+                "interactive-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-12T10:00:00Z",
+                        "content": (
+                            "<USER_REQUEST>User prose: changed setting `Model Selection` from Alpha to Beta.</USER_REQUEST>"
+                            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from None to ModelA.</USER_SETTINGS_CHANGE>"
+                        ),
+                    },
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-12T10:01:00Z",
+                        "content": (
+                            "<USER_REQUEST>Switch now</USER_REQUEST>"
+                            "<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from ModelA to ModelB.</USER_SETTINGS_CHANGE>"
+                        ),
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-12T10:02:00Z",
+                        "content": "Read, denied edit, re-read, and failing command quoting denial",
+                        "tool_calls": [
+                            {
+                                "name": "read_file",
+                                "args": {
+                                    "Path": "/ws/a.py",
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "name": "edit_file",
+                                "args": {"Path": "/ws/a.py", "Replacement": "x"},
+                            },
+                            {
+                                "name": "read_file",
+                                "args": {
+                                    "Path": "/ws/a.py",
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "python3 fail.py"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Surgical Diff Guard: denied",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Command exited with code 1.\nBlocked by PreToolUse: Bounded Read Guard",
+                    },
+                ],
+            )
+            # Older interactive conv (exceeds limit=1) and older headless conv (must still be collected!)
+            self._write_steps(
+                brain,
+                "interactive-2-older",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-11T10:00:00Z",
+                        "content": "<USER_REQUEST>Older interactive</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-11T10:00:05Z",
+                        "content": "Done",
+                        "input_tokens": 9999,
+                    },
+                ],
+            )
+            self._write_steps(
+                brain,
+                "headless-oldest",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T10:00:00Z",
+                        "content": "Subagent run",
+                        "input_tokens": 700,
+                        "output_tokens": 50,
+                    }
+                ],
+            )
+
+            data = self._run_with_brain(
+                tmp_path / "run1", brain, config_dir=cfg, max_conversations=1
+            )
+            # Malformed plugin skipped, valid plugin discovered
+            self.assertNotIn("bad-plugin", data["customization_usage"]["plugins"])
+            self.assertIn("good-plugin", data["customization_usage"]["plugins"])
+            # Only 1 genuine mid-conv model switch (prose in USER_REQUEST ignored)
+            self.assertEqual(data["cache_drift_diagnostics"]["model_switches_total"], 1)
+            # Denied edit did NOT reset epoch: 10 lines read twice -> 50% unmodified overlap
+            self.assertEqual(data["file_view_overlap"]["unmodified_overlap_pct"], 50.0)
+            # Command quoting "Blocked by PreToolUse" still counted as failure, not denial
+            self.assertEqual(data["commands"], 1)
+            self.assertEqual(data["failures"], 1)
+            self.assertEqual(data["hook_denials"]["total"], 1)
+            self.assertEqual(
+                data["hook_denials"]["by_guard"], {"Surgical Diff Guard": 1}
+            )
+            # Primary capped at 1 interactive, but older headless still collected
+            self.assertEqual(data["conversations"], 1)
+            self.assertEqual(data["interactive_conversations"], 1)
+            self.assertEqual(data["subagent_or_headless_conversations"], 1)
+            self.assertEqual(data["total_api_tokens_including_subagents"], 750)
+
+            # 5. Explicit --conv headless IDs are subject to max_conversations
+            self._write_steps(
+                brain,
+                "headless-second",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-10T11:00:00Z",
+                        "content": "Subagent 2",
+                        "input_tokens": 300,
+                    }
+                ],
+            )
+            conv_limited = self._run_with_brain(
+                tmp_path / "run2",
+                brain,
+                config_dir=cfg,
+                include_conv="headless-oldest,headless-second",
+                max_conversations=1,
+            )
+            self.assertEqual(conv_limited["conversations"], 1)
+            self.assertEqual(conv_limited["subagent_or_headless_conversations"], 1)
 
 
 if __name__ == "__main__":
