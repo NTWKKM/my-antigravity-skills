@@ -1970,6 +1970,10 @@ class TestAuditHardeningAndParity(unittest.TestCase):
                                 "name": "run_command",
                                 "args": {"CommandLine": "python3 fail.py"},
                             },
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": '"echo" "notes; gdrive list"'},
+                            },
                         ],
                     },
                     {
@@ -1995,6 +1999,12 @@ class TestAuditHardeningAndParity(unittest.TestCase):
                         "source": "MODEL",
                         "status": "DONE",
                         "content": "Command exited with code 1.\nBlocked by PreToolUse: Bounded Read Guard",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Command exited with code 0.\nnotes; gdrive list",
                     },
                 ],
             )
@@ -2043,9 +2053,16 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(data["cache_drift_diagnostics"]["model_switches_total"], 1)
             # Denied edit did NOT reset epoch: 10 lines read twice -> 50% unmodified overlap
             self.assertEqual(data["file_view_overlap"]["unmodified_overlap_pct"], 50.0)
-            # Command quoting "Blocked by PreToolUse" still counted as failure, not denial
-            self.assertEqual(data["commands"], 1)
+            # Command quoting "Blocked by PreToolUse" still counted as failure, not denial;
+            # '"echo" "notes; gdrive list"' succeeds without falsely crediting gdrive
+            self.assertEqual(data["commands"], 2)
             self.assertEqual(data["failures"], 1)
+            self.assertEqual(
+                data["customization_usage"]["plugins"]
+                .get("gdrive", {})
+                .get("cli_or_script", 0),
+                0,
+            )
             self.assertEqual(data["hook_denials"]["total"], 1)
             self.assertEqual(
                 data["hook_denials"]["by_guard"], {"Surgical Diff Guard": 1}

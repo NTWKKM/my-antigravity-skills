@@ -1475,10 +1475,12 @@ def parse_conversations(
                                     exit_code = int(m.group(1))
                             break
 
-                    cmd_str = clean_str(args.get("CommandLine"))
+                    raw_cmd = args.get("CommandLine")
+                    raw_cmd_str = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
+                    cmd_str = clean_str(raw_cmd)
 
                     # Channel 2 customization attribution: CLI-backed plugins and skill scripts
-                    for exe in extract_command_executables(cmd_str):
+                    for exe in extract_command_executables(raw_cmd_str):
                         if exe in effective_cli_to_plugin:
                             customization_events.append(
                                 (
