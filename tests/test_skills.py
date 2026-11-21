@@ -2400,6 +2400,62 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(d2["hook_denials"]["total"], 1)
             self.assertEqual(d2["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
 
+            # 6. Out-of-order results with tool_call_id: conflicting positional denial must not match command
+            brain3 = tmp2_path / "brain_ooo"
+            self._write_steps(
+                brain3,
+                "ooo-ids-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-16T11:00:00Z",
+                        "content": "<USER_REQUEST>Run gdrive and read with IDs</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-16T11:00:01Z",
+                        "content": "Calling both",
+                        "tool_calls": [
+                            {
+                                "id": "call-cmd",
+                                "name": "run_command",
+                                "args": {"CommandLine": "gdrive list"},
+                            },
+                            {
+                                "id": "call-read",
+                                "name": "read_file",
+                                "args": {"Path": "/ws/huge.bin"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-read",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Bounded Read Guard: too large",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-cmd",
+                        "status": "DONE",
+                        "content": "Tool is running as a background task",
+                    },
+                ],
+            )
+            d3 = self._run_with_brain(
+                tmp2_path / "out_ooo", brain3, config_dir=tmp2_path / "nocfg"
+            )
+            self.assertEqual(d3["commands"], 1)
+            self.assertEqual(
+                d3["customization_usage"]["plugins"]["gdrive"]["cli_or_script"], 1
+            )
+            self.assertEqual(d3["hook_denials"]["total"], 1)
+            self.assertEqual(d3["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

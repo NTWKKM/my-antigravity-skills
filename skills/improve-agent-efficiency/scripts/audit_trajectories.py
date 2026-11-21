@@ -1685,25 +1685,38 @@ def parse_conversations(
                     resp_content = ""
                     matched_denial_guard = None
                     tc_call_id = tc.get("id") or tc.get("tool_call_id")
-                    # Prefer matching tool_call_id or positional tool_result_steps[tc_idx] first,
-                    # then fall back to scanning command-output results only (never stealing another call's denial).
+                    # Prefer matching tool_call_id first, then positional tool_result_steps[tc_idx]
+                    # (only when IDs do not conflict), then fallback scan for command-output results only.
                     candidate_steps = []
                     if tc_call_id is not None:
                         for r_idx, r_step in enumerate(tool_result_steps):
                             r_call_id = r_step.get("tool_call_id") or r_step.get("id")
                             if r_call_id == tc_call_id:
-                                candidate_steps.append((r_idx, r_step, True))
+                                candidate_steps.append((r_idx, r_step, True, True))
                     if tc_idx < len(tool_result_steps) and not any(
-                        idx == tc_idx for idx, _, _ in candidate_steps
+                        idx == tc_idx for idx, _, _, _ in candidate_steps
                     ):
-                        candidate_steps.append(
-                            (tc_idx, tool_result_steps[tc_idx], True)
-                        )
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not (
+                            tc_call_id is not None
+                            and pos_call_id is not None
+                            and pos_call_id != tc_call_id
+                        ):
+                            candidate_steps.append((tc_idx, pos_step, True, False))
                     for r_idx, r_step in enumerate(tool_result_steps):
-                        if not any(idx == r_idx for idx, _, _ in candidate_steps):
-                            candidate_steps.append((r_idx, r_step, False))
+                        if any(idx == r_idx for idx, _, _, _ in candidate_steps):
+                            continue
+                        r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                        if (
+                            tc_call_id is not None
+                            and r_call_id is not None
+                            and r_call_id != tc_call_id
+                        ):
+                            continue
+                        candidate_steps.append((r_idx, r_step, False, False))
 
-                    for r_idx, r_step, is_direct_match in candidate_steps:
+                    for r_idx, r_step, is_direct_match, is_id_match in candidate_steps:
                         if r_idx in used_cmd_step_ids:
                             continue
                         m_content = r_step.get("content", "") or ""
@@ -1713,7 +1726,8 @@ def parse_conversations(
                             else None
                         )
                         if (
-                            "exited with code" in m_content
+                            is_id_match
+                            or "exited with code" in m_content
                             or "finished with result:" in m_content
                             or denial_g is not None
                         ):
