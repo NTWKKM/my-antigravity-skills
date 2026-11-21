@@ -405,6 +405,7 @@ def _split_shell_segments(cmd_str):
     in_single = False
     in_double = False
     escaped = False
+    at_word_start = True
     i = 0
     n = len(cmd_str)
     while i < n:
@@ -412,39 +413,50 @@ def _split_shell_segments(cmd_str):
         if escaped:
             buf.append(ch)
             escaped = False
+            at_word_start = False
             i += 1
             continue
         if ch == "\\" and not in_single:
             buf.append(ch)
             escaped = True
+            at_word_start = False
             i += 1
             continue
         if ch == "'" and not in_double:
             in_single = not in_single
             buf.append(ch)
+            at_word_start = False
             i += 1
             continue
         if ch == '"' and not in_single:
             in_double = not in_double
             buf.append(ch)
+            at_word_start = False
             i += 1
             continue
         if not in_single and not in_double:
-            if ch == "#" and (not buf or buf[-1].isspace()):
+            if ch == "#" and at_word_start:
                 while i < n and cmd_str[i] != "\n":
                     i += 1
                 continue
             if cmd_str[i : i + 2] in ("&&", "||"):
                 segments.append("".join(buf))
                 buf = []
+                at_word_start = True
                 i += 2
                 continue
             if ch in (";", "|", "\n"):
                 segments.append("".join(buf))
                 buf = []
+                at_word_start = True
                 i += 1
                 continue
+            buf.append(ch)
+            at_word_start = ch.isspace()
+            i += 1
+            continue
         buf.append(ch)
+        at_word_start = False
         i += 1
     if buf:
         segments.append("".join(buf))

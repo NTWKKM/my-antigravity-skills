@@ -2157,6 +2157,13 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             ),
             ["echo", "gdocs"],
         )
+        # Escaped whitespace before '#' is NOT a word boundary (Bash runs gdrive)
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                r"echo foo\ #suffix; gdrive list"
+            ),
+            ["echo", "gdrive"],
+        )
 
         # 2. Script path attribution only in executable or interpreter-operand position
         self.assertEqual(
