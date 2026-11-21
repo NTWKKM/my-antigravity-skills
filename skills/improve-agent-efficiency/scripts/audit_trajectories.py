@@ -417,6 +417,13 @@ def _split_shell_segments(cmd_str):
             i += 1
             continue
         if ch == "\\" and not in_single:
+            # Line continuation (\<newline>) is removed by the shell, preserving word boundary
+            if i + 1 < n and cmd_str[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                i += 3
+                continue
             buf.append(ch)
             escaped = True
             at_word_start = False

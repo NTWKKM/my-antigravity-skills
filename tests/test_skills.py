@@ -2164,6 +2164,19 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             ),
             ["echo", "gdrive"],
         )
+        # Backslash-newline preserves preceding word boundary (comment vs continued word)
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                "echo ok \\\n# note; gdrive list\ngdocs list"
+            ),
+            ["echo", "gdocs"],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                "echo foo\\\n#suffix; gdrive list"
+            ),
+            ["echo", "gdrive"],
+        )
 
         # 2. Script path attribution only in executable or interpreter-operand position
         self.assertEqual(
