@@ -28,7 +28,7 @@ This reference documents the JSON schema produced by [`scripts/audit_trajectorie
 
 6. **Interactive vs Subagent Cohort Separation & Hook Denial Isolation**:
    - Conversations with `user_turns >= 1` are classified as `interactive`; sessions with `user_turns == 0` (spawned subagents and headless SDK runs) are classified as `subagent_or_headless`.
-   - By default (`--include-subagents` omitted), primary cohort summaries and bootstrap significance tests are scoped strictly to interactive sessions so `median_turns_per_conv` is not dragged to `0.0` and conversation-level independence is preserved. Subagent telemetry is emitted in `subagent_summary` and combined spend is reported in `total_api_tokens_including_subagents` across the sessions retained after `--limit` rules (pass `--all` when you need totals across the full filtered window).
+   - By default (when neither `--include-subagents` nor `--conv` is used), primary cohort summaries and bootstrap significance tests are scoped strictly to interactive sessions so `median_turns_per_conv` is not dragged to `0.0` and conversation-level independence is preserved. Passing `--conv` may include explicitly selected zero-turn (`subagent_or_headless`) sessions in the primary summary and, in `--compare` mode, in bootstrap samples. Subagent telemetry is emitted in `subagent_summary` and combined spend is reported in `total_api_tokens_including_subagents` across the sessions retained after `--limit` rules (pass `--all` when you need totals across the full filtered window).
    - `PreToolUse` denials (`"tool call denied by pre-tool hook"`, `"Blocked by PreToolUse"`) are excluded from true runtime command `failures` and reported separately in `hook_denials`.
 
 ---

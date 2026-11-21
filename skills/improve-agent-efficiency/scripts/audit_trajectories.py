@@ -446,12 +446,23 @@ def _split_shell_segments(cmd_str):
                 while i < n and cmd_str[i] != "\n":
                     i += 1
                 continue
-            if cmd_str[i : i + 2] in ("&&", "||"):
-                segments.append("".join(buf))
-                buf = []
-                at_word_start = True
-                i += 2
-                continue
+            if ch in ("&", "|"):
+                j = i + 1
+                while j < n and cmd_str[j] == "\\":
+                    if j + 1 < n and cmd_str[j + 1] == "\n":
+                        j += 2
+                    elif (
+                        j + 2 < n and cmd_str[j + 1] == "\r" and cmd_str[j + 2] == "\n"
+                    ):
+                        j += 3
+                    else:
+                        break
+                if j < n and cmd_str[j] == ch:
+                    segments.append("".join(buf))
+                    buf = []
+                    at_word_start = True
+                    i = j + 1
+                    continue
             if ch in (";", "|", "\n"):
                 segments.append("".join(buf))
                 buf = []
@@ -474,7 +485,7 @@ def extract_command_executables(cmd_str):
     """Extract executable basenames invoked across shell command segments."""
     if not cmd_str or not isinstance(cmd_str, str):
         return []
-    cleaned = HEREDOC_BODY_RE.sub("", cmd_str)
+    cleaned = HEREDOC_BODY_RE.sub("\n", cmd_str)
     executables = []
     for segment in _split_shell_segments(cleaned):
         tokens = segment.strip().split()
@@ -521,6 +532,20 @@ SCRIPT_INTERPRETERS = frozenset(
     }
 )
 INTERPRETER_INLINE_FLAGS = frozenset({"-c", "-e", "-m", "--eval", "-command"})
+INTERPRETER_VALUE_FLAGS = frozenset(
+    {
+        "-W",
+        "-X",
+        "--check-hash-based-pycs",
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "--conditions",
+        "--env-file",
+        "-o",
+    }
+)
 WRAPPER_VALUE_FLAGS = frozenset(
     {"--with", "--with-requirements", "--from", "--python", "--directory", "-p", "-C"}
 )
@@ -584,7 +609,7 @@ def extract_command_script_targets(cmd_str):
     """Return ('skills'|'plugins', name) tuples for scripts invoked in executable or interpreter-operand position."""
     if not cmd_str or not isinstance(cmd_str, str):
         return []
-    cleaned = HEREDOC_BODY_RE.sub("", cmd_str)
+    cleaned = HEREDOC_BODY_RE.sub("\n", cmd_str)
     targets = []
     for segment in _split_shell_segments(cleaned):
         tokens = _tokenize_shell_segment(segment)
@@ -627,11 +652,36 @@ def extract_command_script_targets(cmd_str):
                     if arg == "--":
                         j += 1
                         break
-                    if arg.lower() in INTERPRETER_INLINE_FLAGS:
+                    arg_low = arg.lower()
+                    if base in ("python", "python3", "py"):
+                        is_inline_opt = arg_low in ("-c", "-m") or arg_low.startswith(
+                            ("-c", "-m")
+                        )
+                    elif base in ("bash", "sh", "zsh"):
+                        is_inline_opt = arg_low == "-c" or (
+                            arg_low.startswith("-")
+                            and not arg_low.startswith("--")
+                            and "c" in arg_low[1:]
+                        )
+                    elif base in ("pwsh", "powershell"):
+                        is_inline_opt = arg_low in (
+                            "-c",
+                            "-command",
+                            "-encodedcommand",
+                            "-enc",
+                        )
+                    else:
+                        is_inline_opt = (
+                            arg_low in INTERPRETER_INLINE_FLAGS
+                            or arg_low.startswith(("-e", "--eval=", "-c"))
+                        )
+                    if is_inline_opt:
                         inline_code = True
                         break
                     if arg.startswith("-"):
                         j += 1
+                        if arg in INTERPRETER_VALUE_FLAGS and j < len(tokens):
+                            j += 1
                         continue
                     break
                 if not inline_code and j < len(tokens):
@@ -1634,19 +1684,34 @@ def parse_conversations(
                     exit_code = None
                     resp_content = ""
                     matched_denial_guard = None
-                    # Prefer matching positional tool_result_steps[tc_idx] first, then scan all tool_result_steps
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    # Prefer matching tool_call_id or positional tool_result_steps[tc_idx] first,
+                    # then fall back to scanning command-output results only (never stealing another call's denial).
                     candidate_steps = []
-                    if tc_idx < len(tool_result_steps):
-                        candidate_steps.append((tc_idx, tool_result_steps[tc_idx]))
+                    if tc_call_id is not None:
+                        for r_idx, r_step in enumerate(tool_result_steps):
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                candidate_steps.append((r_idx, r_step, True))
+                    if tc_idx < len(tool_result_steps) and not any(
+                        idx == tc_idx for idx, _, _ in candidate_steps
+                    ):
+                        candidate_steps.append(
+                            (tc_idx, tool_result_steps[tc_idx], True)
+                        )
                     for r_idx, r_step in enumerate(tool_result_steps):
-                        if r_idx != tc_idx:
-                            candidate_steps.append((r_idx, r_step))
+                        if not any(idx == r_idx for idx, _, _ in candidate_steps):
+                            candidate_steps.append((r_idx, r_step, False))
 
-                    for r_idx, r_step in candidate_steps:
+                    for r_idx, r_step, is_direct_match in candidate_steps:
                         if r_idx in used_cmd_step_ids:
                             continue
                         m_content = r_step.get("content", "") or ""
-                        denial_g = extract_hook_denial_guard(r_step)
+                        denial_g = (
+                            extract_hook_denial_guard(r_step)
+                            if is_direct_match
+                            else None
+                        )
                         if (
                             "exited with code" in m_content
                             or "finished with result:" in m_content

@@ -2292,6 +2292,7 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             # Raw attempts preserved in tool_call_counts, but surgical_edits & ratio use non-denied counts
             self.assertEqual(data["tool_call_counts"]["edit_file"], 1)
             self.assertEqual(data["tool_call_counts"]["run_command"], 2)
+            self.assertEqual(data["write_to_file_modes"].get("overwrite"), 1)
             self.assertEqual(data["surgical_edits"], 0)
             self.assertEqual(data["surgical_edit_ratio_pct"], 0.0)
             self.assertEqual(data["hook_denials"]["total"], 2)
@@ -2315,6 +2316,89 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(
                 data["customization_usage"]["plugins"]["custom-plug"]["mcp"], 1
             )
+
+        # 4. Continuation-split &&, heredoc trailing newline, attached -cpass, -W ignore
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                "echo ok &\\\n& gdrive list"
+            ),
+            ["echo", "gdrive"],
+        )
+        heredoc_then_py = "cat <<'EOF'\nhello\nEOF\npython3 skills/demo/run.py"
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(heredoc_then_py),
+            ["cat", "python3"],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(heredoc_then_py),
+            [("skills", "demo")],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "python3 -cpass skills/demo/run.py"
+            ),
+            [],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "python3 -W ignore skills/demo/run.py"
+            ),
+            [("skills", "demo")],
+        )
+
+        # 5. Fallback scan must not steal another tool call's denial onto an unblocked run_command
+        with tempfile.TemporaryDirectory() as tmp2:
+            tmp2_path = Path(tmp2)
+            brain2 = tmp2_path / "brain"
+            self._write_steps(
+                brain2,
+                "no-steal-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-16T10:00:00Z",
+                        "content": "<USER_REQUEST>Run gdrive and read</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-16T10:00:01Z",
+                        "content": "Calling both",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "gdrive list"},
+                            },
+                            {
+                                "name": "read_file",
+                                "args": {"Path": "/ws/huge.bin"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Tool is running as a background task",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Bounded Read Guard: too large",
+                    },
+                ],
+            )
+            d2 = self._run_with_brain(
+                tmp2_path / "out", brain2, config_dir=tmp2_path / "nocfg"
+            )
+            self.assertEqual(d2["commands"], 1)
+            self.assertEqual(
+                d2["customization_usage"]["plugins"]["gdrive"]["cli_or_script"], 1
+            )
+            self.assertEqual(d2["hook_denials"]["total"], 1)
+            self.assertEqual(d2["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
 
 
 if __name__ == "__main__":
