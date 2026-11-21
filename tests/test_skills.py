@@ -2130,7 +2130,7 @@ class TestAuditHardeningAndParity(unittest.TestCase):
                 tmp_path / "run4",
                 brain,
                 config_dir=cfg,
-                since_date="2026-11-12",
+                since_date="2026-11-12T00:00:00Z",
                 compare_mode=True,
                 include_subagents=True,
                 max_conversations=1,
@@ -2146,6 +2146,154 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(
                 cmp_block["baseline_total_api_tokens_including_subagents"],
                 9999 + 1050,
+            )
+
+    def test_pr4_followup_attribution_and_ratio_regressions(self):
+        """Regression tests for shell comments, denied CLI/edit handling, script-position attribution, and mcp_ calls."""
+        # 1. Shell comment handling in _split_shell_segments / extract_command_executables
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(
+                'echo "a # ; firebase" # ; gdrive list\ngdocs list'
+            ),
+            ["echo", "gdocs"],
+        )
+
+        # 2. Script path attribution only in executable or interpreter-operand position
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "echo skills/shinystat/scripts/run.py"
+            ),
+            [],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "python3 -c \"print('skills/shinystat/scripts/run.py')\""
+            ),
+            [],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "python3 skills/shinystat/scripts/run.py --arg 1 && ./plugins/demo/bin/go.sh"
+            ),
+            [("skills", "shinystat"), ("plugins", "demo")],
+        )
+
+        # 3. End-to-end: denied gdrive not credited, blocked edit + accepted overwrite => 0% ratio,
+        #    direct mcp_<serverName>_<toolName> with underscores credited to server + parent plugin
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            brain = tmp_path / "brain"
+            cfg = tmp_path / "cfg"
+            pdir = cfg / "plugins" / "custom-plug"
+            pdir.mkdir(parents=True)
+            (pdir / "plugin.json").write_text('{"disabled": false}', encoding="utf-8")
+            (pdir / "mcp_config.json").write_text(
+                json.dumps({"mcpServers": {"my_custom_srv": {"command": "node"}}}),
+                encoding="utf-8",
+            )
+
+            self._write_steps(
+                brain,
+                "e2e-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-15T10:00:00Z",
+                        "content": "<USER_REQUEST>Run tools</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-15T10:00:01Z",
+                        "content": "Execute",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "gdrive list"},
+                            },
+                            {
+                                "name": "run_command",
+                                "args": {
+                                    "CommandLine": "echo skills/shinystat/scripts/run.py"
+                                },
+                            },
+                            {
+                                "name": "edit_file",
+                                "args": {"Path": "/ws/f.py", "Replacement": "x"},
+                            },
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "Path": "/ws/f.py",
+                                    "Overwrite": True,
+                                    "Content": "full",
+                                },
+                            },
+                            {
+                                "name": "mcp_my_custom_srv_list_items",
+                                "args": {},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: GDrive Guard: denied",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Command exited with code 0.\nskills/shinystat/scripts/run.py",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Surgical Diff Guard: denied",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                ],
+            )
+            data = self._run_with_brain(tmp_path / "out", brain, config_dir=cfg)
+            # Raw attempts preserved in tool_call_counts, but surgical_edits & ratio use non-denied counts
+            self.assertEqual(data["tool_call_counts"]["edit_file"], 1)
+            self.assertEqual(data["tool_call_counts"]["run_command"], 2)
+            self.assertEqual(data["surgical_edits"], 0)
+            self.assertEqual(data["surgical_edit_ratio_pct"], 0.0)
+            self.assertEqual(data["hook_denials"]["total"], 2)
+            # Denied gdrive list and echoed skill path NOT credited
+            self.assertEqual(
+                data["customization_usage"]["plugins"]
+                .get("gdrive", {})
+                .get("cli_or_script", 0),
+                0,
+            )
+            self.assertEqual(
+                data["customization_usage"]["skills"]
+                .get("shinystat", {})
+                .get("cli_or_script", 0),
+                0,
+            )
+            # Direct mcp_my_custom_srv_list_items credited to both server and parent plugin
+            self.assertEqual(
+                data["customization_usage"]["mcp_servers"]["my_custom_srv"]["mcp"], 1
+            )
+            self.assertEqual(
+                data["customization_usage"]["plugins"]["custom-plug"]["mcp"], 1
             )
 
 

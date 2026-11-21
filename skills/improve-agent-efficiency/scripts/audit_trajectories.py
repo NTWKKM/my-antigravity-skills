@@ -430,6 +430,10 @@ def _split_shell_segments(cmd_str):
             i += 1
             continue
         if not in_single and not in_double:
+            if ch == "#" and (not buf or buf[-1].isspace()):
+                while i < n and cmd_str[i] != "\n":
+                    i += 1
+                continue
             if cmd_str[i : i + 2] in ("&&", "||"):
                 segments.append("".join(buf))
                 buf = []
@@ -475,6 +479,155 @@ def extract_command_executables(cmd_str):
             executables.append(base)
             break
     return executables
+
+
+SCRIPT_INTERPRETERS = frozenset(
+    {
+        "python",
+        "python3",
+        "py",
+        "bash",
+        "sh",
+        "zsh",
+        "node",
+        "deno",
+        "bun",
+        "tsx",
+        "ts-node",
+        "ruby",
+        "perl",
+        "pwsh",
+        "powershell",
+        "rscript",
+    }
+)
+INTERPRETER_INLINE_FLAGS = frozenset({"-c", "-e", "-m", "--eval", "-command"})
+WRAPPER_VALUE_FLAGS = frozenset(
+    {"--with", "--with-requirements", "--from", "--python", "--directory", "-p", "-C"}
+)
+
+
+def _tokenize_shell_segment(segment):
+    """Split a single shell segment into unquoted tokens while respecting quotes and escapes."""
+    tokens = []
+    buf = []
+    in_single = False
+    in_double = False
+    escaped = False
+    in_token = False
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            in_token = True
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            nxt = segment[i + 1] if i + 1 < n else ""
+            if nxt in ("\\", '"', "'", " ", "\t", ";", "|", "&", "#", "$", "(", ")"):
+                escaped = True
+                in_token = True
+                i += 1
+                continue
+            buf.append(ch)
+            in_token = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            in_token = True
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            in_token = True
+            i += 1
+            continue
+        if not in_single and not in_double and ch.isspace():
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+            i += 1
+            continue
+        buf.append(ch)
+        in_token = True
+        i += 1
+    if in_token:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def extract_command_script_targets(cmd_str):
+    """Return ('skills'|'plugins', name) tuples for scripts invoked in executable or interpreter-operand position."""
+    if not cmd_str or not isinstance(cmd_str, str):
+        return []
+    cleaned = HEREDOC_BODY_RE.sub("", cmd_str)
+    targets = []
+    for segment in _split_shell_segments(cleaned):
+        tokens = _tokenize_shell_segment(segment)
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx].strip("()")
+            if not tok:
+                idx += 1
+                continue
+            if ENV_ASSIGN_RE.match(tok):
+                idx += 1
+                continue
+            base = os.path.basename(tok.replace("\\", "/")).lower()
+            if base in CMD_WRAPPERS:
+                idx += 1
+                if base in ("uv", "pnpm") and idx < len(tokens):
+                    sub = tokens[idx].lower()
+                    if sub in ("run", "exec", "dlx"):
+                        idx += 1
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    flag = tokens[idx]
+                    idx += 1
+                    if flag in WRAPPER_VALUE_FLAGS and idx < len(tokens):
+                        idx += 1
+                continue
+
+            # Candidate 1: script path directly in executable position
+            cand_path = None
+            tok_posix = tok.replace("\\", "/")
+            if SKILL_SCRIPT_PATH_RE.search(tok_posix) or PLUGIN_SCRIPT_PATH_RE.search(
+                tok_posix
+            ):
+                cand_path = tok_posix
+            elif base in SCRIPT_INTERPRETERS:
+                # Candidate 2: first positional script operand of a supported interpreter
+                j = idx + 1
+                inline_code = False
+                while j < len(tokens):
+                    arg = tokens[j]
+                    if arg == "--":
+                        j += 1
+                        break
+                    if arg.lower() in INTERPRETER_INLINE_FLAGS:
+                        inline_code = True
+                        break
+                    if arg.startswith("-"):
+                        j += 1
+                        continue
+                    break
+                if not inline_code and j < len(tokens):
+                    cand_path = tokens[j].replace("\\", "/")
+
+            if cand_path:
+                m_sp = SKILL_SCRIPT_PATH_RE.search(cand_path)
+                if m_sp:
+                    targets.append(("skills", m_sp.group(1)))
+                else:
+                    m_pp = PLUGIN_SCRIPT_PATH_RE.search(cand_path)
+                    if m_pp:
+                        targets.append(("plugins", m_pp.group(1)))
+            break
+    return targets
 
 
 def discover_installed_customizations(config_dir=None):
@@ -861,6 +1014,7 @@ def parse_conversations(
     baseline_since_dt=None,
     include_subagents=False,
     cli_to_plugin=None,
+    mcp_server_names=None,
 ):
     effective_cli_to_plugin = {}
     for pname, clis in KNOWN_PLUGIN_CLIS.items():
@@ -869,6 +1023,13 @@ def parse_conversations(
     if cli_to_plugin:
         for cli, pname in cli_to_plugin.items():
             effective_cli_to_plugin[cli.lower()] = pname
+
+    effective_mcp_servers = set(KNOWN_PLUGIN_MCP_PREFIXES.keys())
+    if mcp_server_names:
+        for sname in mcp_server_names:
+            if isinstance(sname, str) and sname:
+                effective_mcp_servers.add(sname)
+    sorted_mcp_servers = sorted(effective_mcp_servers, key=len, reverse=True)
 
     sorted_repo_norms = sorted(
         list(candidate_repos.keys()), key=lambda x: len(x), reverse=True
@@ -1093,6 +1254,7 @@ def parse_conversations(
         epoch_total_lines = 0
         epoch_unique_lines = 0
         write_to_file_modes = Counter()
+        surgical_edits_count = 0
         skills_notice_count = 0
         skills_notice_chars = 0
         user_turns_count = 0
@@ -1360,6 +1522,8 @@ def parse_conversations(
                             write_to_file_modes["append"] += 1
                         else:
                             write_to_file_modes["create"] += 1
+                    elif tname in EDIT_TOOLS:
+                        surgical_edits_count += 1
 
                     # Flush and reset unmodified epoch for this file
                     if target_key and target_key in file_lines_read_epoch:
@@ -1431,6 +1595,13 @@ def parse_conversations(
                     if sname:
                         customization_events.append(("mcp_servers", sname, "mcp"))
 
+                elif isinstance(tname, str) and tname.startswith("mcp_"):
+                    rem = tname[4:]
+                    for sname in sorted_mcp_servers:
+                        if rem.startswith(sname + "_") and len(rem) > len(sname) + 1:
+                            customization_events.append(("mcp_servers", sname, "mcp"))
+                            break
+
                 elif tname == "invoke_subagent":
                     aname = clean_str(
                         args.get("TypeName")
@@ -1479,6 +1650,10 @@ def parse_conversations(
                     raw_cmd_str = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
                     cmd_str = clean_str(raw_cmd)
 
+                    if matched_denial_guard is not None:
+                        # Hook-denied commands never executed; exclude from CLI/script attribution and runtime failures
+                        continue
+
                     # Channel 2 customization attribution: CLI-backed plugins and skill scripts
                     for exe in extract_command_executables(raw_cmd_str):
                         if exe in effective_cli_to_plugin:
@@ -1489,18 +1664,12 @@ def parse_conversations(
                                     "cli_or_script",
                                 )
                             )
-                    for m_sp in SKILL_SCRIPT_PATH_RE.findall(
-                        cmd_str.replace("\\", "/")
+                    for target_cat, target_name in extract_command_script_targets(
+                        raw_cmd_str
                     ):
-                        customization_events.append(("skills", m_sp, "cli_or_script"))
-                    for m_pp in PLUGIN_SCRIPT_PATH_RE.findall(
-                        cmd_str.replace("\\", "/")
-                    ):
-                        customization_events.append(("plugins", m_pp, "cli_or_script"))
-
-                    if matched_denial_guard is not None:
-                        # Hook-denied commands never executed; exclude from true runtime failures
-                        continue
+                        customization_events.append(
+                            (target_cat, target_name, "cli_or_script")
+                        )
 
                     is_failed = False
                     if exit_code is not None:
@@ -1754,6 +1923,7 @@ def parse_conversations(
                 "tool_call_counts": dict(tool_call_counts),
                 "total_tool_calls": sum(tool_call_counts.values()),
                 "write_to_file_modes": dict(write_to_file_modes),
+                "surgical_edits": surgical_edits_count,
                 "hook_denials_total": sum(hook_denials_by_guard.values()),
                 "hook_denials_by_guard": dict(hook_denials_by_guard),
                 "compactions_count": compactions_count,
@@ -1981,7 +2151,12 @@ def calculate_cohort_summary(conv_list, installed_customizations=None):
         if total_tool_calls > 0
         else 0.0
     )
-    surgical_edits = sum(tool_call_counts_totals.get(t, 0) for t in EDIT_TOOLS)
+    surgical_edits = sum(
+        c["surgical_edits"]
+        if "surgical_edits" in c
+        else sum(c.get("tool_call_counts", {}).get(t, 0) for t in EDIT_TOOLS)
+        for c in conv_list
+    )
     full_overwrites = write_to_file_totals.get("overwrite", 0)
     surgical_edit_ratio_pct = (
         round(surgical_edits / (surgical_edits + full_overwrites) * 100, 2)
@@ -2679,6 +2854,7 @@ def run_audit(
         compare_mode=compare_mode,
         include_subagents=include_subagents,
         cli_to_plugin=installed_customizations.get("cli_to_plugin"),
+        mcp_server_names=list(installed_customizations.get("mcp_servers", {}).keys()),
     )
 
     interactive_convs_all = [
