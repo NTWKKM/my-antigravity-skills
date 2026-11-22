@@ -1666,9 +1666,39 @@ def parse_conversations(
                     s_line = args.get("StartLine")
                     e_line = args.get("EndLine")
                     is_bounded = s_line is not None and e_line is not None
-                    v_len = 0
-                    if tc_idx < len(tool_result_steps):
-                        v_len = len(tool_result_steps[tc_idx].get("content", "") or "")
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
+                    matched_read_step = None
+                    if tc_call_id is not None:
+                        for r_step in tool_result_steps:
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                matched_read_step = r_step
+                                break
+                    if matched_read_step is None and tc_idx < len(tool_result_steps):
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not (
+                            pos_call_id is not None
+                            and (
+                                (tc_call_id is not None and pos_call_id != tc_call_id)
+                                or pos_call_id in other_call_ids
+                            )
+                        ):
+                            matched_read_step = pos_step
+                    v_len = (
+                        len(matched_read_step.get("content", "") or "")
+                        if matched_read_step is not None
+                        else 0
+                    )
                     t_file = clean_str(
                         args.get("Path")
                         or args.get("AbsolutePath")

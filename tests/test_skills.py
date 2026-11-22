@@ -2607,6 +2607,65 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(d5["surgical_edits"], 1)
             self.assertEqual(d5["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
 
+            # 10. Out-of-order read_file result matched by tool_call_id for bounded_view_tokens
+            brain6 = tmp3_path / "brain_ooo_read"
+            self._write_steps(
+                brain6,
+                "ooo-read-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-17T11:00:00Z",
+                        "content": "<USER_REQUEST>Read bounded file and run command</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-17T11:00:01Z",
+                        "content": "Calling both",
+                        "tool_calls": [
+                            {
+                                "id": "call-read-1",
+                                "name": "read_file",
+                                "args": {
+                                    "Path": "/ws/demo.py",
+                                    "StartLine": 1,
+                                    "EndLine": 10,
+                                },
+                            },
+                            {
+                                "id": "call-cmd-1",
+                                "name": "run_command",
+                                "args": {"CommandLine": "echo hi"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-cmd-1",
+                        "status": "DONE",
+                        "content": "Command exited with code 0.\n" + ("C" * 400),
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-read-1",
+                        "status": "DONE",
+                        "content": "R" * 80,
+                    },
+                ],
+            )
+            d6 = self._run_with_brain(
+                tmp3_path / "out_ooo_read", brain6, config_dir=tmp3_path / "nocfg"
+            )
+            self.assertEqual(d6["tool_breakdown"]["bounded_view_tokens"], 20)
+            self.assertEqual(
+                d6["tool_breakdown"]["run_command_tokens"],
+                round(len("Command exited with code 0.\n" + ("C" * 400)) / 4),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
