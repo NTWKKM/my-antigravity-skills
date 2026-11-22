@@ -2451,6 +2451,10 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             )
             self.assertEqual(d3["commands"], 1)
             self.assertEqual(
+                d3["tool_breakdown"]["run_command_tokens"],
+                round(len("Tool is running as a background task") / 4),
+            )
+            self.assertEqual(
                 d3["customization_usage"]["plugins"]["gdrive"]["cli_or_script"], 1
             )
             self.assertEqual(d3["hook_denials"]["total"], 1)
@@ -2509,6 +2513,99 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             )
             self.assertEqual(d4["hook_denials"]["total"], 1)
             self.assertEqual(d4["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
+
+        # 8. Bash -C (noclobber) vs -c/-ec, and heredoc opening-line pipeline preservation
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                "bash -C skills/demo/run.sh"
+            ),
+            [("skills", "demo")],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(
+                'bash -ec "echo skills/demo/run.sh"'
+            ),
+            [],
+        )
+        heredoc_pipe = (
+            "cat <<'EOF' | gdrive upload -\nhello\nEOF\npython3 skills/demo/run.py"
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_executables(heredoc_pipe),
+            ["cat", "gdrive", "python3"],
+        )
+        self.assertEqual(
+            audit_trajectories.extract_command_script_targets(heredoc_pipe),
+            [("skills", "demo")],
+        )
+
+        # 9. Zero-token API ground truth, out-of-order edit_file vs read_file denial, and unreadable plugins dir
+        with tempfile.TemporaryDirectory() as tmp3:
+            tmp3_path = Path(tmp3)
+            brain5 = tmp3_path / "brain_zero_and_edit"
+            cfg5 = tmp3_path / "cfg5"
+            (cfg5 / "plugins").mkdir(parents=True)
+            self._write_steps(
+                brain5,
+                "zero-gt-edit-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-17T10:00:00Z",
+                        "content": "<USER_REQUEST>Edit and read</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-17T10:00:01Z",
+                        "content": "Doing edit and read",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "tool_calls": [
+                            {
+                                "id": "call-edit",
+                                "name": "edit_file",
+                                "args": {"Path": "/ws/a.py", "Replacement": "ok"},
+                            },
+                            {
+                                "id": "call-read",
+                                "name": "read_file",
+                                "args": {"Path": "/ws/big.bin"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-read",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Bounded Read Guard: too large",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-edit",
+                        "status": "DONE",
+                        "content": "ok",
+                    },
+                ],
+            )
+            orig_iterdir = Path.iterdir
+
+            def _guarded_iterdir(self_path):
+                if self_path == cfg5 / "plugins":
+                    raise PermissionError("unreadable plugins dir")
+                return orig_iterdir(self_path)
+
+            with mock.patch.object(Path, "iterdir", _guarded_iterdir):
+                d5 = self._run_with_brain(tmp3_path / "out", brain5, config_dir=cfg5)
+
+            self.assertTrue(d5["api_tokens_ground_truth"]["has_ground_truth"])
+            self.assertEqual(d5["api_tokens_ground_truth"]["total_api_tokens_all"], 0)
+            self.assertIsNone(d5["api_tokens_ground_truth"]["cache_hit_rate_pct"])
+            self.assertEqual(d5["surgical_edits"], 1)
+            self.assertEqual(d5["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
 
 
 if __name__ == "__main__":

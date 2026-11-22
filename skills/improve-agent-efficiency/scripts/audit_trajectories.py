@@ -295,6 +295,21 @@ HEREDOC_BODY_RE = re.compile(
     r"(?:<<-\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\t*\1[ \t]*(?:\n|$)|<<\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\2[ \t]*(?:\n|$))",
     re.DOTALL,
 )
+HEREDOC_BODY_MASK_RE = re.compile(
+    r"(<<-\s*['\"]?(\w+)['\"]?([^\n]*))\n.*?\n\t*\2[ \t]*(?:\n|$)"
+    r"|(<<\s*['\"]?(\w+)['\"]?([^\n]*))\n.*?\n\5[ \t]*(?:\n|$)",
+    re.DOTALL,
+)
+
+
+def _strip_heredoc_bodies(cmd_str):
+    """Mask here-document bodies and closing delimiters while preserving opening-line commands and trailing newline."""
+    return HEREDOC_BODY_MASK_RE.sub(
+        lambda m: (m.group(3) if m.group(1) is not None else m.group(6)) + "\n",
+        cmd_str,
+    )
+
+
 MODEL_CHANGE_RE = re.compile(
     r"changed setting `Model Selection` from [^\n]*? to ([^\n<]+?)\.(?:\s|<|$)"
 )
@@ -485,7 +500,7 @@ def extract_command_executables(cmd_str):
     """Extract executable basenames invoked across shell command segments."""
     if not cmd_str or not isinstance(cmd_str, str):
         return []
-    cleaned = HEREDOC_BODY_RE.sub("\n", cmd_str)
+    cleaned = _strip_heredoc_bodies(cmd_str)
     executables = []
     for segment in _split_shell_segments(cleaned):
         tokens = segment.strip().split()
@@ -609,7 +624,7 @@ def extract_command_script_targets(cmd_str):
     """Return ('skills'|'plugins', name) tuples for scripts invoked in executable or interpreter-operand position."""
     if not cmd_str or not isinstance(cmd_str, str):
         return []
-    cleaned = HEREDOC_BODY_RE.sub("\n", cmd_str)
+    cleaned = _strip_heredoc_bodies(cmd_str)
     targets = []
     for segment in _split_shell_segments(cleaned):
         tokens = _tokenize_shell_segment(segment)
@@ -658,10 +673,10 @@ def extract_command_script_targets(cmd_str):
                             ("-c", "-m")
                         )
                     elif base in ("bash", "sh", "zsh"):
-                        is_inline_opt = arg_low == "-c" or (
-                            arg_low.startswith("-")
-                            and not arg_low.startswith("--")
-                            and "c" in arg_low[1:]
+                        is_inline_opt = arg == "-c" or (
+                            arg.startswith("-")
+                            and not arg.startswith("--")
+                            and "c" in arg[1:]
                         )
                     elif base in ("pwsh", "powershell"):
                         is_inline_opt = arg_low in (
@@ -736,7 +751,11 @@ def discover_installed_customizations(config_dir=None):
 
     plugins_dir = cfg_dir / "plugins"
     if plugins_dir.exists() and plugins_dir.is_dir():
-        for pdir in sorted(plugins_dir.iterdir()):
+        try:
+            plugin_entries = sorted(plugins_dir.iterdir())
+        except OSError:
+            plugin_entries = []
+        for pdir in plugin_entries:
             if not pdir.is_dir():
                 continue
             pname = pdir.name
@@ -1569,13 +1588,41 @@ def parse_conversations(
                                     )
 
                 if tname in FILE_MODIFY_TOOLS:
-                    if tc_idx < len(tool_result_steps):
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
+                    matched_edit_idx = None
+                    if tc_call_id is not None:
+                        for r_idx, r_step in enumerate(tool_result_steps):
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                matched_edit_idx = r_idx
+                                break
+                    if matched_edit_idx is None and tc_idx < len(tool_result_steps):
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not (
+                            pos_call_id is not None
+                            and (
+                                (tc_call_id is not None and pos_call_id != tc_call_id)
+                                or pos_call_id in other_call_ids
+                            )
+                        ):
+                            matched_edit_idx = tc_idx
+                    if matched_edit_idx is not None:
                         edit_denial_g = extract_hook_denial_guard(
-                            tool_result_steps[tc_idx]
+                            tool_result_steps[matched_edit_idx]
                         )
                         if edit_denial_g is not None:
-                            if tc_idx not in counted_denial_step_ids:
-                                counted_denial_step_ids.add(tc_idx)
+                            if matched_edit_idx not in counted_denial_step_ids:
+                                counted_denial_step_ids.add(matched_edit_idx)
                                 hook_denials_by_guard[edit_denial_g] += 1
                             continue
                     target_f = clean_str(
@@ -2343,11 +2390,7 @@ def calculate_cohort_summary(conv_list, installed_customizations=None):
     total_api_input_tok = total_api_input_raw_tok + total_api_cache_creation_tok
     total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
     total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
-    has_api_gt = num_api_convs > 0 and (
-        total_api_input_tok > 0
-        or total_api_cache_read_tok > 0
-        or total_api_output_tok > 0
-    )
+    has_api_gt = num_api_convs > 0
     total_api_context_processed = total_api_input_tok + total_api_cache_read_tok
     total_api_tokens_all = total_api_context_processed + total_api_output_tok
 

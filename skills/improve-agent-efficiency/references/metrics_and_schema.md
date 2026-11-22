@@ -80,7 +80,7 @@ In standard mode, the root object also includes `include_subagents`, `interactiv
   - `model_switches_total` & `convs_with_model_switch`: Mid-conversation `<USER_SETTINGS_CHANGE>` `Model Selection` switches (excludes initial `from None to <model>` selection).
   - `persistent_hook_system_messages`: `{ "count", "tokens", "per_conv", "tokens_per_conv" }` for `SYSTEM_MESSAGE` injections from `PreInvocation` hooks (`[CONTRACT DIARY:`, `[ACTIVE WORKSPACE:`, `[ZERO-SLASH MANDATE:`).
 - **4-Channel Customization Usage Attribution (`customization_usage`)**:
-  - Zero top-N truncation, excluding audit sessions by default. Discovers installed customizations from `~/.gemini/config/config.json`, `~/.gemini/config/mcp_config.json`, `~/.gemini/config/skills/*/SKILL.md`, and `~/.gemini/config/agents/*.md`.
+  - Zero top-N truncation, excluding audit sessions by default. Discovers installed customizations from `~/.gemini/config/config.json`, `~/.gemini/config/plugins/` (plugin `plugin.json` manifests, CLI declarations in `plugin.json`/`auth.json`, bundled `*mcp*.json` configs, and plugin-bundled `agents/`), `~/.gemini/config/mcp_config.json`, `~/.gemini/config/skills/*/SKILL.md`, and `~/.gemini/config/agents/*.md` — entries discovered from `~/.gemini/config/plugins/` produce report records alongside `config.json` entries.
   - Top-level maps: `plugins`, `skills`, `mcp_servers`, `agents`.
   - Each item reports `{ "enabled": Bool, "total": N, "skill_read": N, "cli_or_script": N, "mcp": N, "agent": N, "conversations": N }`:
     1. `skill_read`: `read_file`/`view_file` reads of `/plugins/<plugin>/.../SKILL.md` or `/skills/<skill>/SKILL.md`.
