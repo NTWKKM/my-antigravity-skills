@@ -1685,8 +1685,26 @@ def parse_conversations(
                     resp_content = ""
                     matched_denial_guard = None
                     tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
+
+                    def _belongs_to_other_call(r_call_id):
+                        if r_call_id is None:
+                            return False
+                        if tc_call_id is not None and r_call_id != tc_call_id:
+                            return True
+                        return r_call_id in other_call_ids
+
                     # Prefer matching tool_call_id first, then positional tool_result_steps[tc_idx]
-                    # (only when IDs do not conflict), then fallback scan for command-output results only.
+                    # (only when IDs do not conflict or belong to another call in the batch),
+                    # then fallback scan for command-output results only.
                     candidate_steps = []
                     if tc_call_id is not None:
                         for r_idx, r_step in enumerate(tool_result_steps):
@@ -1698,21 +1716,13 @@ def parse_conversations(
                     ):
                         pos_step = tool_result_steps[tc_idx]
                         pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
-                        if not (
-                            tc_call_id is not None
-                            and pos_call_id is not None
-                            and pos_call_id != tc_call_id
-                        ):
+                        if not _belongs_to_other_call(pos_call_id):
                             candidate_steps.append((tc_idx, pos_step, True, False))
                     for r_idx, r_step in enumerate(tool_result_steps):
                         if any(idx == r_idx for idx, _, _, _ in candidate_steps):
                             continue
                         r_call_id = r_step.get("tool_call_id") or r_step.get("id")
-                        if (
-                            tc_call_id is not None
-                            and r_call_id is not None
-                            and r_call_id != tc_call_id
-                        ):
+                        if _belongs_to_other_call(r_call_id):
                             continue
                         candidate_steps.append((r_idx, r_step, False, False))
 

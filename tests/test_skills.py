@@ -2456,6 +2456,60 @@ class TestAuditHardeningAndParity(unittest.TestCase):
             self.assertEqual(d3["hook_denials"]["total"], 1)
             self.assertEqual(d3["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
 
+            # 7. Command without ID + read_file with ID whose denial arrives first at position 0
+            brain4 = tmp2_path / "brain_partial_id"
+            self._write_steps(
+                brain4,
+                "partial-id-1",
+                [
+                    {
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "created_at": "2026-11-16T12:00:00Z",
+                        "content": "<USER_REQUEST>Run gdrive without ID and read with ID</USER_REQUEST>",
+                    },
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "created_at": "2026-11-16T12:00:01Z",
+                        "content": "Calling both",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "gdrive list"},
+                            },
+                            {
+                                "id": "call-read-only",
+                                "name": "read_file",
+                                "args": {"Path": "/ws/huge.bin"},
+                            },
+                        ],
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "tool_call_id": "call-read-only",
+                        "status": "ERROR",
+                        "content": "Blocked by PreToolUse: Bounded Read Guard: too large",
+                    },
+                    {
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Tool is running as a background task",
+                    },
+                ],
+            )
+            d4 = self._run_with_brain(
+                tmp2_path / "out_partial_id", brain4, config_dir=tmp2_path / "nocfg"
+            )
+            self.assertEqual(d4["commands"], 1)
+            self.assertEqual(
+                d4["customization_usage"]["plugins"]["gdrive"]["cli_or_script"], 1
+            )
+            self.assertEqual(d4["hook_denials"]["total"], 1)
+            self.assertEqual(d4["hook_denials"]["by_guard"], {"Bounded Read Guard": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
