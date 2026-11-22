@@ -295,9 +295,637 @@ HEREDOC_BODY_RE = re.compile(
     r"(?:<<-\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\t*\1[ \t]*(?:\n|$)|<<\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\2[ \t]*(?:\n|$))",
     re.DOTALL,
 )
+HEREDOC_BODY_MASK_RE = re.compile(
+    r"(<<-\s*['\"]?(\w+)['\"]?([^\n]*))\n.*?\n\t*\2[ \t]*(?:\n|$)"
+    r"|(<<\s*['\"]?(\w+)['\"]?([^\n]*))\n.*?\n\5[ \t]*(?:\n|$)",
+    re.DOTALL,
+)
+
+
+def _strip_heredoc_bodies(cmd_str):
+    """Mask here-document bodies and closing delimiters while preserving opening-line commands and trailing newline."""
+    return HEREDOC_BODY_MASK_RE.sub(
+        lambda m: (m.group(3) if m.group(1) is not None else m.group(6)) + "\n",
+        cmd_str,
+    )
+
+
 MODEL_CHANGE_RE = re.compile(
     r"changed setting `Model Selection` from [^\n]*? to ([^\n<]+?)\.(?:\s|<|$)"
 )
+MODEL_SWITCH_RE = re.compile(
+    r"changed setting `Model Selection` from ([^\n]*?) to ([^\n<]+?)\.(?:\s|<|$)"
+)
+USER_REQUEST_BLOCK_RE = re.compile(r"<USER_REQUEST>.*?</USER_REQUEST>", re.DOTALL)
+USER_SETTINGS_CHANGE_RE = re.compile(
+    r"<USER_SETTINGS_CHANGE>(.*?)</USER_SETTINGS_CHANGE>", re.DOTALL
+)
+
+READ_TOOLS = frozenset({"read_file", "view_file"})
+WRITE_TOOLS = frozenset({"write_file", "write_to_file"})
+EDIT_TOOLS = frozenset(
+    {"edit_file", "replace_file_content", "multi_replace_file_content"}
+)
+FILE_MODIFY_TOOLS = WRITE_TOOLS | EDIT_TOOLS
+
+HOOK_DENIAL_MARKERS = (
+    "tool call denied by pre-tool hook",
+    "blocked by pretooluse",
+)
+HOOK_DENIAL_ENVELOPE_RE = re.compile(
+    r"^\s*(?:(?:encountered error in step execution|error|tool execution error|hook denied)\s*:\s*)?"
+    r"(?:tool call denied by pre-tool hook|blocked by pretooluse)\b",
+    re.IGNORECASE,
+)
+CMD_EXECUTION_HEADER_RE = re.compile(
+    r"(?:^|\n)\s*Command\s+(?:exited with code\s+-?\d+|finished with result:)",
+    re.IGNORECASE,
+)
+
+PERSISTENT_SYS_MSG_MARKERS = (
+    "injected by a preinvocation hook",
+    "[contract diary:",
+    "[active workspace:",
+    "[zero-slash mandate:",
+)
+
+KNOWN_PLUGIN_CLIS = {
+    "gdocs": ("gdocs",),
+    "gdrive": ("gdrive",),
+    "gsheets": ("gsheets",),
+    "gcalendar": ("gcalendar",),
+    "gslides": ("gslides",),
+    "coderabbit": ("coderabbit", "cr"),
+    "firebase": ("firebase",),
+    "9arm-skills": ("claude-9arm",),
+}
+
+KNOWN_PLUGIN_MCP_PREFIXES = {
+    "firebase-mcp-server": "firebase",
+}
+
+PLUGIN_SKILL_READ_RE = re.compile(
+    r"/plugins/([A-Za-z0-9][A-Za-z0-9._-]*)/(?:.+/)?SKILL\.md$", re.IGNORECASE
+)
+STANDALONE_SKILL_READ_RE = re.compile(
+    r"/skills/([A-Za-z0-9][A-Za-z0-9._-]*)/SKILL\.md$", re.IGNORECASE
+)
+SKILL_SCRIPT_PATH_RE = re.compile(
+    r"(?:^|[\s\"'/\\])skills/([A-Za-z0-9][A-Za-z0-9._-]*)/"
+)
+PLUGIN_SCRIPT_PATH_RE = re.compile(
+    r"(?:^|[\s\"'/\\])plugins/([A-Za-z0-9][A-Za-z0-9._-]*)/"
+)
+CMD_SEGMENT_SPLIT_RE = re.compile(r"(?:&&|\|\||;|\||\n)")
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+CMD_WRAPPERS = frozenset({"env", "sudo", "npx", "pnpm", "yarn", "uv", "time", "nohup"})
+
+
+def extract_hook_denial_guard(text_or_step, status=None):
+    """Return the PreToolUse guard name if a tool-result step/envelope represents a hook denial, else None."""
+    if isinstance(text_or_step, dict):
+        status = text_or_step.get("status") if status is None else status
+        text = text_or_step.get("content", "") or ""
+    else:
+        text = text_or_step
+    if not text or not isinstance(text, str):
+        return None
+    if isinstance(status, str) and status.strip().upper() in (
+        "DONE",
+        "SUCCESS",
+        "SUCCEEDED",
+        "OK",
+    ):
+        return None
+    if CMD_EXECUTION_HEADER_RE.search(text):
+        return None
+    m = HOOK_DENIAL_ENVELOPE_RE.match(text)
+    if not m:
+        return None
+    remainder = text[m.end() :].lstrip(" :\t-")
+    first_line = remainder.splitlines()[0].strip() if remainder else ""
+    if not first_line:
+        return "Unknown Guard"
+    if ":" in first_line:
+        prefix = first_line.split(":", 1)[0].strip()
+        if prefix and len(prefix) <= 64:
+            return prefix
+    return first_line[:64].strip() or "Unknown Guard"
+
+
+def _split_shell_segments(cmd_str):
+    """Split a shell command string on unquoted control operators (&&, ||, ;, |, newline)."""
+    segments = []
+    buf = []
+    in_single = False
+    in_double = False
+    escaped = False
+    at_word_start = True
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            at_word_start = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            # Line continuation (\<newline>) is removed by the shell, preserving word boundary
+            if i + 1 < n and cmd_str[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                i += 3
+                continue
+            buf.append(ch)
+            escaped = True
+            at_word_start = False
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            buf.append(ch)
+            at_word_start = False
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buf.append(ch)
+            at_word_start = False
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "#" and at_word_start:
+                while i < n and cmd_str[i] != "\n":
+                    i += 1
+                continue
+            if ch in ("&", "|"):
+                j = i + 1
+                while j < n and cmd_str[j] == "\\":
+                    if j + 1 < n and cmd_str[j + 1] == "\n":
+                        j += 2
+                    elif (
+                        j + 2 < n and cmd_str[j + 1] == "\r" and cmd_str[j + 2] == "\n"
+                    ):
+                        j += 3
+                    else:
+                        break
+                if j < n and cmd_str[j] == ch:
+                    segments.append("".join(buf))
+                    buf = []
+                    at_word_start = True
+                    i = j + 1
+                    continue
+            if ch in (";", "|", "\n"):
+                segments.append("".join(buf))
+                buf = []
+                at_word_start = True
+                i += 1
+                continue
+            buf.append(ch)
+            at_word_start = ch.isspace()
+            i += 1
+            continue
+        buf.append(ch)
+        at_word_start = False
+        i += 1
+    if buf:
+        segments.append("".join(buf))
+    return segments
+
+
+def extract_command_executables(cmd_str):
+    """Extract executable basenames invoked across shell command segments."""
+    if not cmd_str or not isinstance(cmd_str, str):
+        return []
+    cleaned = _strip_heredoc_bodies(cmd_str)
+    executables = []
+    for segment in _split_shell_segments(cleaned):
+        tokens = segment.strip().split()
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx].strip("\"'()")
+            if not tok:
+                idx += 1
+                continue
+            if ENV_ASSIGN_RE.match(tok):
+                idx += 1
+                continue
+            base = os.path.basename(tok.replace("\\", "/")).lower()
+            if base in CMD_WRAPPERS:
+                idx += 1
+                if base in ("uv", "pnpm") and idx < len(tokens):
+                    sub = tokens[idx].strip("\"'").lower()
+                    if sub in ("run", "exec", "dlx"):
+                        idx += 1
+                continue
+            executables.append(base)
+            break
+    return executables
+
+
+SCRIPT_INTERPRETERS = frozenset(
+    {
+        "python",
+        "python3",
+        "py",
+        "bash",
+        "sh",
+        "zsh",
+        "node",
+        "deno",
+        "bun",
+        "tsx",
+        "ts-node",
+        "ruby",
+        "perl",
+        "pwsh",
+        "powershell",
+        "rscript",
+    }
+)
+INTERPRETER_INLINE_FLAGS = frozenset({"-c", "-e", "-m", "--eval", "-command"})
+INTERPRETER_VALUE_FLAGS = frozenset(
+    {
+        "-W",
+        "-X",
+        "--check-hash-based-pycs",
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "--conditions",
+        "--env-file",
+        "-o",
+    }
+)
+WRAPPER_VALUE_FLAGS = frozenset(
+    {"--with", "--with-requirements", "--from", "--python", "--directory", "-p", "-C"}
+)
+
+
+def _tokenize_shell_segment(segment):
+    """Split a single shell segment into unquoted tokens while respecting quotes and escapes."""
+    tokens = []
+    buf = []
+    in_single = False
+    in_double = False
+    escaped = False
+    in_token = False
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            in_token = True
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            nxt = segment[i + 1] if i + 1 < n else ""
+            if nxt in ("\\", '"', "'", " ", "\t", ";", "|", "&", "#", "$", "(", ")"):
+                escaped = True
+                in_token = True
+                i += 1
+                continue
+            buf.append(ch)
+            in_token = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            in_token = True
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            in_token = True
+            i += 1
+            continue
+        if not in_single and not in_double and ch.isspace():
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+            i += 1
+            continue
+        buf.append(ch)
+        in_token = True
+        i += 1
+    if in_token:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def extract_command_script_targets(cmd_str):
+    """Return ('skills'|'plugins', name) tuples for scripts invoked in executable or interpreter-operand position."""
+    if not cmd_str or not isinstance(cmd_str, str):
+        return []
+    cleaned = _strip_heredoc_bodies(cmd_str)
+    targets = []
+    for segment in _split_shell_segments(cleaned):
+        tokens = _tokenize_shell_segment(segment)
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx].strip("()")
+            if not tok:
+                idx += 1
+                continue
+            if ENV_ASSIGN_RE.match(tok):
+                idx += 1
+                continue
+            base = os.path.basename(tok.replace("\\", "/")).lower()
+            if base in CMD_WRAPPERS:
+                idx += 1
+                if base in ("uv", "pnpm") and idx < len(tokens):
+                    sub = tokens[idx].lower()
+                    if sub in ("run", "exec", "dlx"):
+                        idx += 1
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    flag = tokens[idx]
+                    idx += 1
+                    if flag in WRAPPER_VALUE_FLAGS and idx < len(tokens):
+                        idx += 1
+                continue
+
+            # Candidate 1: script path directly in executable position
+            cand_path = None
+            tok_posix = tok.replace("\\", "/")
+            if SKILL_SCRIPT_PATH_RE.search(tok_posix) or PLUGIN_SCRIPT_PATH_RE.search(
+                tok_posix
+            ):
+                cand_path = tok_posix
+            elif base in SCRIPT_INTERPRETERS:
+                # Candidate 2: first positional script operand of a supported interpreter
+                j = idx + 1
+                inline_code = False
+                while j < len(tokens):
+                    arg = tokens[j]
+                    if arg == "--":
+                        j += 1
+                        break
+                    arg_low = arg.lower()
+                    if base in ("python", "python3", "py"):
+                        is_inline_opt = arg_low in ("-c", "-m") or arg_low.startswith(
+                            ("-c", "-m")
+                        )
+                    elif base in ("bash", "sh", "zsh"):
+                        is_inline_opt = arg == "-c" or (
+                            arg.startswith("-")
+                            and not arg.startswith("--")
+                            and "c" in arg[1:]
+                        )
+                    elif base in ("pwsh", "powershell"):
+                        is_inline_opt = arg_low in (
+                            "-c",
+                            "-command",
+                            "-encodedcommand",
+                            "-enc",
+                        )
+                    else:
+                        is_inline_opt = (
+                            arg_low in INTERPRETER_INLINE_FLAGS
+                            or arg_low.startswith(("-e", "--eval=", "-c"))
+                        )
+                    if is_inline_opt:
+                        inline_code = True
+                        break
+                    if arg.startswith("-"):
+                        j += 1
+                        if arg in INTERPRETER_VALUE_FLAGS and j < len(tokens):
+                            j += 1
+                        continue
+                    break
+                if not inline_code and j < len(tokens):
+                    cand_path = tokens[j].replace("\\", "/")
+
+            if cand_path:
+                m_sp = SKILL_SCRIPT_PATH_RE.search(cand_path)
+                if m_sp:
+                    targets.append(("skills", m_sp.group(1)))
+                else:
+                    m_pp = PLUGIN_SCRIPT_PATH_RE.search(cand_path)
+                    if m_pp:
+                        targets.append(("plugins", m_pp.group(1)))
+            break
+    return targets
+
+
+def discover_installed_customizations(config_dir=None):
+    """Discover installed plugins, standalone skills, MCP servers, and custom agents."""
+    cfg_dir = (
+        Path(config_dir)
+        if config_dir is not None
+        else (Path.home() / ".gemini" / "config")
+    )
+    plugins = {}
+    skills = {}
+    mcp_servers = {}
+    agents = {}
+    mcp_to_plugin = dict(KNOWN_PLUGIN_MCP_PREFIXES)
+    agent_to_plugin = {}
+    cli_to_plugin = {}
+
+    for pname, clis in KNOWN_PLUGIN_CLIS.items():
+        for cli in clis:
+            cli_to_plugin[cli.lower()] = pname
+
+    config_json = cfg_dir / "config.json"
+    if config_json.exists():
+        try:
+            data = json.loads(config_json.read_text(encoding="utf-8", errors="ignore"))
+            raw_plugins = data.get("plugins") or {}
+            if isinstance(raw_plugins, dict):
+                for pname, pcfg in raw_plugins.items():
+                    enabled = (
+                        bool(pcfg.get("enabled", True))
+                        if isinstance(pcfg, dict)
+                        else True
+                    )
+                    plugins[pname] = {"enabled": enabled}
+        except Exception:
+            pass
+
+    plugins_dir = cfg_dir / "plugins"
+    if plugins_dir.exists() and plugins_dir.is_dir():
+        try:
+            plugin_entries = sorted(plugins_dir.iterdir())
+        except OSError:
+            plugin_entries = []
+        for pdir in plugin_entries:
+            if not pdir.is_dir():
+                continue
+            pname = pdir.name
+            pj_data = {}
+            pj = pdir / "plugin.json"
+            if pj.exists():
+                try:
+                    decoded = json.loads(
+                        pj.read_text(encoding="utf-8", errors="ignore")
+                    )
+                except Exception:
+                    decoded = {}
+                if not isinstance(decoded, dict):
+                    continue
+                pj_data = decoded
+            if pname not in plugins:
+                plugins[pname] = {"enabled": not bool(pj_data.get("disabled", False))}
+
+            # Discover plugin-declared CLI names if present in plugin.json or auth.json
+            for key in ("cli", "clis", "bin"):
+                val = pj_data.get(key)
+                if isinstance(val, str) and val.strip():
+                    cli_to_plugin.setdefault(val.strip().lower(), pname)
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str) and item.strip():
+                            cli_to_plugin.setdefault(item.strip().lower(), pname)
+                elif isinstance(val, dict):
+                    for k in val:
+                        if isinstance(k, str) and k.strip():
+                            cli_to_plugin.setdefault(k.strip().lower(), pname)
+
+            auth_json = pdir / "auth.json"
+            if auth_json.exists():
+                try:
+                    adata = json.loads(
+                        auth_json.read_text(encoding="utf-8", errors="ignore")
+                    )
+                    if isinstance(adata, dict):
+                        for cli_val in adata.get("clis", []) or []:
+                            if isinstance(cli_val, str) and cli_val.strip():
+                                cli_to_plugin.setdefault(cli_val.strip().lower(), pname)
+                except Exception:
+                    pass
+
+            # Discover plugin-bundled MCP servers
+            for mf in pdir.glob("*mcp*.json"):
+                try:
+                    mdata = json.loads(mf.read_text(encoding="utf-8", errors="ignore"))
+                    for sname, scfg in (mdata.get("mcpServers") or {}).items():
+                        mcp_to_plugin[sname] = pname
+                        if sname not in mcp_servers:
+                            mcp_servers[sname] = {
+                                "enabled": plugins[pname]["enabled"]
+                                and not (
+                                    isinstance(scfg, dict)
+                                    and bool(scfg.get("disabled"))
+                                )
+                            }
+                except Exception:
+                    pass
+
+            # Discover plugin-bundled agents
+            p_agents_dir = pdir / "agents"
+            if p_agents_dir.exists() and p_agents_dir.is_dir():
+                for af in sorted(p_agents_dir.glob("*.md")):
+                    aname = af.stem
+                    agent_to_plugin[aname] = pname
+                    if aname not in agents:
+                        agents[aname] = {"enabled": plugins[pname]["enabled"]}
+
+    mcp_json = cfg_dir / "mcp_config.json"
+    if mcp_json.exists():
+        try:
+            mdata = json.loads(mcp_json.read_text(encoding="utf-8", errors="ignore"))
+            for sname, scfg in (mdata.get("mcpServers") or {}).items():
+                enabled = (
+                    not bool(scfg.get("disabled", False))
+                    if isinstance(scfg, dict)
+                    else True
+                )
+                mcp_servers[sname] = {"enabled": enabled}
+        except Exception:
+            pass
+
+    skills_dir = cfg_dir / "skills"
+    if skills_dir.exists() and skills_dir.is_dir():
+        for smd in sorted(skills_dir.glob("*/SKILL.md")):
+            sname = smd.parent.name
+            skills[sname] = {"enabled": True}
+
+    agents_dir = cfg_dir / "agents"
+    if agents_dir.exists() and agents_dir.is_dir():
+        for af in sorted(agents_dir.glob("*.md")):
+            agents[af.stem] = {"enabled": True}
+
+    return {
+        "plugins": plugins,
+        "skills": skills,
+        "mcp_servers": mcp_servers,
+        "agents": agents,
+        "mcp_to_plugin": mcp_to_plugin,
+        "agent_to_plugin": agent_to_plugin,
+        "cli_to_plugin": cli_to_plugin,
+    }
+
+
+def aggregate_customization_usage(conv_list, installed=None):
+    """Aggregate 4-channel customization usage across conversations with zero truncation."""
+    inst = installed or {}
+    mcp_to_plugin = dict(KNOWN_PLUGIN_MCP_PREFIXES)
+    mcp_to_plugin.update(inst.get("mcp_to_plugin", {}))
+    agent_to_plugin = dict(inst.get("agent_to_plugin", {}))
+
+    categories = ("plugins", "skills", "mcp_servers", "agents")
+    records = {}
+    conv_sets = {}
+    for cat in categories:
+        records[cat] = {}
+        conv_sets[cat] = defaultdict(set)
+        for name, meta in (inst.get(cat) or {}).items():
+            records[cat][name] = {
+                "enabled": bool(meta.get("enabled", True))
+                if isinstance(meta, dict)
+                else True,
+                "total": 0,
+                "skill_read": 0,
+                "cli_or_script": 0,
+                "mcp": 0,
+                "agent": 0,
+                "conversations": 0,
+            }
+
+    def _bump(cat, name, channel, cid):
+        if not name:
+            return
+        if name not in records[cat]:
+            records[cat][name] = {
+                "enabled": False,
+                "total": 0,
+                "skill_read": 0,
+                "cli_or_script": 0,
+                "mcp": 0,
+                "agent": 0,
+                "conversations": 0,
+            }
+        records[cat][name][channel] += 1
+        records[cat][name]["total"] += 1
+        conv_sets[cat][name].add(cid)
+
+    for c in conv_list:
+        cid = c.get("id", "")
+        for ev_cat, ev_name, ev_chan in c.get("customization_events", []):
+            _bump(ev_cat, ev_name, ev_chan, cid)
+            if ev_cat == "mcp_servers" and ev_name in mcp_to_plugin:
+                _bump("plugins", mcp_to_plugin[ev_name], "mcp", cid)
+            elif ev_cat == "agents" and ev_name in agent_to_plugin:
+                _bump("plugins", agent_to_plugin[ev_name], "agent", cid)
+
+    out = {}
+    for cat in categories:
+        for name, entry in records[cat].items():
+            entry["conversations"] = len(conv_sets[cat].get(name, set()))
+        out[cat] = dict(
+            sorted(
+                records[cat].items(),
+                key=lambda kv: (-kv[1]["total"], kv[0]),
+            )
+        )
+    return out
 
 
 def is_python_heredoc(cmd_str):
@@ -472,7 +1100,25 @@ def parse_conversations(
     compare_mode=False,
     include_convs=None,
     baseline_since_dt=None,
+    include_subagents=False,
+    cli_to_plugin=None,
+    mcp_server_names=None,
 ):
+    effective_cli_to_plugin = {}
+    for pname, clis in KNOWN_PLUGIN_CLIS.items():
+        for cli in clis:
+            effective_cli_to_plugin[cli.lower()] = pname
+    if cli_to_plugin:
+        for cli, pname in cli_to_plugin.items():
+            effective_cli_to_plugin[cli.lower()] = pname
+
+    effective_mcp_servers = set(KNOWN_PLUGIN_MCP_PREFIXES.keys())
+    if mcp_server_names:
+        for sname in mcp_server_names:
+            if isinstance(sname, str) and sname:
+                effective_mcp_servers.add(sname)
+    sorted_mcp_servers = sorted(effective_mcp_servers, key=len, reverse=True)
+
     sorted_repo_norms = sorted(
         list(candidate_repos.keys()), key=lambda x: len(x), reverse=True
     )
@@ -641,21 +1287,34 @@ def parse_conversations(
     total_candidates = len(conv_candidates)
     target_count = 0
     baseline_count = 0
+    primary_count = 0
+    headless_in_primary = bool(include_subagents or include_conv_set)
+    stop_when_quota_full = bool(include_conv_set)
 
     for mtime, item, tpath, conv_dt in conv_candidates:
+        primary_quota_full = False
         if max_conversations and max_conversations > 0:
             if compare_mode and since_dt:
                 if (
                     target_count >= max_conversations
                     and baseline_count >= max_conversations
                 ):
-                    break
-                if conv_dt >= since_dt and target_count >= max_conversations:
-                    continue
-                if conv_dt < since_dt and baseline_count >= max_conversations:
-                    continue
-            elif len(conversations) >= max_conversations:
-                break
+                    if stop_when_quota_full:
+                        break
+                    primary_quota_full = True
+                elif conv_dt >= since_dt and target_count >= max_conversations:
+                    if stop_when_quota_full:
+                        continue
+                    primary_quota_full = True
+                elif conv_dt < since_dt and baseline_count >= max_conversations:
+                    if stop_when_quota_full:
+                        continue
+                    primary_quota_full = True
+            else:
+                if primary_count >= max_conversations:
+                    if stop_when_quota_full:
+                        break
+                    primary_quota_full = True
         first_prompt = ""
         user_prompts = []
         active_ws = ""
@@ -671,6 +1330,7 @@ def parse_conversations(
         planner_prose_chars = 0
         planner_tool_args_chars = 0
         tool_args_chars_by_tool = Counter()
+        tool_call_counts = Counter()
         run_cmd_output_chars = 0
         file_views_count = 0
         file_views_unbounded = 0
@@ -682,16 +1342,25 @@ def parse_conversations(
         epoch_total_lines = 0
         epoch_unique_lines = 0
         write_to_file_modes = Counter()
+        surgical_edits_count = 0
         skills_notice_count = 0
         skills_notice_chars = 0
         user_turns_count = 0
         api_input_tokens = 0
+        api_cache_creation_tokens = 0
         api_cache_read_tokens = 0
         api_output_tokens = 0
         has_api_tokens = False
         ephemeral_by_cat = Counter()
         model_changes = []
         model_events = []
+        seen_models_in_conv = []
+        model_switches_count = 0
+        compactions_count = 0
+        persistent_hook_sys_msg_count = 0
+        persistent_hook_sys_msg_chars = 0
+        hook_denials_by_guard = Counter()
+        customization_events = []
 
         try:
             with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
@@ -699,17 +1368,57 @@ def parse_conversations(
         except Exception:
             continue
 
+        if primary_quota_full and not stop_when_quota_full:
+            if any(
+                s.get("type", "") == "USER_INPUT"
+                or s.get("source", "") == "USER_EXPLICIT"
+                for s in steps
+            ):
+                continue
+
         for i, step in enumerate(steps):
             st = step.get("type", "")
             source = step.get("source", "")
             content = step.get("content", "") or ""
             thinking = step.get("thinking", "") or ""
 
-            if "input_tokens" in step:
+            if any(
+                step.get(k) is not None
+                for k in (
+                    "input_tokens",
+                    "cache_read_tokens",
+                    "cache_creation_input_tokens",
+                    "output_tokens",
+                )
+            ):
                 has_api_tokens = True
                 api_input_tokens += step.get("input_tokens") or 0
+                api_cache_creation_tokens += (
+                    step.get("cache_creation_input_tokens") or 0
+                )
                 api_cache_read_tokens += step.get("cache_read_tokens") or 0
                 api_output_tokens += step.get("output_tokens") or 0
+
+            if (
+                st in ("USER_INPUT", "SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE")
+                or source in ("USER_EXPLICIT", "SYSTEM", "SYSTEM_SDK")
+            ) and "<USER_SETTINGS_CHANGE>" in content:
+                non_request_content = USER_REQUEST_BLOCK_RE.sub("", content)
+                for settings_block in USER_SETTINGS_CHANGE_RE.findall(
+                    non_request_content
+                ):
+                    for from_m, to_m in MODEL_SWITCH_RE.findall(settings_block):
+                        from_clean = from_m.strip()
+                        to_clean = to_m.strip()
+                        if not to_clean:
+                            continue
+                        if (
+                            from_clean.lower() != "none" and from_clean != to_clean
+                        ) or (
+                            seen_models_in_conv and to_clean != seen_models_in_conv[-1]
+                        ):
+                            model_switches_count += 1
+                        seen_models_in_conv.append(to_clean)
 
             if st == "USER_INPUT" or source == "USER_EXPLICIT":
                 user_turns_count += 1
@@ -750,7 +1459,8 @@ def parse_conversations(
                 tcs_step = step.get("tool_calls", [])
                 for tc_item in tcs_step:
                     tname_item = tc_item.get("name") or "other"
-                    targs = tc_item.get("args") or {}
+                    tool_call_counts[tname_item] += 1
+                    targs = tc_item.get("args") or tc_item.get("arguments") or {}
                     targs_str = (
                         json.dumps(targs, ensure_ascii=False)
                         if isinstance(targs, dict)
@@ -765,6 +1475,17 @@ def parse_conversations(
                 "CONVERSATION_HISTORY",
             ] or source in ["SYSTEM_SDK", "SYSTEM"]:
                 total_system_chars += len(content)
+                if "# Resuming from a compaction" in content:
+                    compactions_count += 1
+                if (
+                    st == "SYSTEM_MESSAGE"
+                    or (
+                        source in ("SYSTEM_SDK", "SYSTEM")
+                        and "<SYSTEM_MESSAGE>" in content
+                    )
+                ) and any(m in content.lower() for m in PERSISTENT_SYS_MSG_MARKERS):
+                    persistent_hook_sys_msg_count += 1
+                    persistent_hook_sys_msg_chars += len(content)
                 if "ACTIVE SKILLS LOADED" in content or "ZERO-SLASH MANDATE" in content:
                     ephemeral_by_cat["skills_notice"] += len(content)
                     skills_notice_count += 1
@@ -842,6 +1563,7 @@ def parse_conversations(
                     tool_result_steps.append(sj)
 
             used_cmd_step_ids = set()
+            counted_denial_step_ids = set()
             for tc_idx, tc in enumerate(tc_list):
                 tname = tc.get("name")
                 args = tc.get("args") or tc.get("arguments") or {}
@@ -865,31 +1587,70 @@ def parse_conversations(
                                         reverse=True,
                                     )
 
-                if tname in [
-                    "write_to_file",
-                    "replace_file_content",
-                    "write_file",
-                    "edit_file",
-                ]:
-                    target_f = clean_str(args.get("Path") or args.get("TargetFile"))
-                    if tname in ("write_to_file", "write_file"):
+                if tname in FILE_MODIFY_TOOLS:
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
+                    matched_edit_idx = None
+                    if tc_call_id is not None:
+                        for r_idx, r_step in enumerate(tool_result_steps):
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                matched_edit_idx = r_idx
+                                break
+                    if matched_edit_idx is None and tc_idx < len(tool_result_steps):
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not (
+                            pos_call_id is not None
+                            and (
+                                (tc_call_id is not None and pos_call_id != tc_call_id)
+                                or pos_call_id in other_call_ids
+                            )
+                        ):
+                            matched_edit_idx = tc_idx
+                    if matched_edit_idx is not None:
+                        edit_denial_g = extract_hook_denial_guard(
+                            tool_result_steps[matched_edit_idx]
+                        )
+                        if edit_denial_g is not None:
+                            if matched_edit_idx not in counted_denial_step_ids:
+                                counted_denial_step_ids.add(matched_edit_idx)
+                                hook_denials_by_guard[edit_denial_g] += 1
+                            continue
+                    target_f = clean_str(
+                        args.get("Path")
+                        or args.get("TargetFile")
+                        or args.get("AbsolutePath")
+                    )
+                    target_key = norm_path(target_f) or target_f
+                    if tname in WRITE_TOOLS:
                         if args.get("Overwrite") is True:
                             write_to_file_modes["overwrite"] += 1
                         elif args.get("Append") is True:
                             write_to_file_modes["append"] += 1
                         else:
                             write_to_file_modes["create"] += 1
+                    elif tname in EDIT_TOOLS:
+                        surgical_edits_count += 1
 
                     # Flush and reset unmodified epoch for this file
-                    if target_f and target_f in file_lines_read_epoch:
-                        for s_int, e_int in file_lines_read_epoch[target_f]:
+                    if target_key and target_key in file_lines_read_epoch:
+                        for s_int, e_int in file_lines_read_epoch[target_key]:
                             epoch_total_lines += max(0, e_int - s_int + 1)
                         ep_uniq = set()
-                        for s_int, e_int in file_lines_read_epoch[target_f]:
+                        for s_int, e_int in file_lines_read_epoch[target_key]:
                             for ln in range(s_int, e_int + 1):
                                 ep_uniq.add(ln)
                         epoch_unique_lines += len(ep_uniq)
-                        file_lines_read_epoch[target_f] = []
+                        file_lines_read_epoch[target_key] = []
 
                     action_trace.append(
                         {
@@ -900,57 +1661,202 @@ def parse_conversations(
                         }
                     )
 
-                elif tname in ("view_file", "read_file"):
+                elif tname in READ_TOOLS:
                     file_views_count += 1
                     s_line = args.get("StartLine")
                     e_line = args.get("EndLine")
                     is_bounded = s_line is not None and e_line is not None
-                    v_len = 0
-                    if tc_idx < len(tool_result_steps):
-                        v_len = len(tool_result_steps[tc_idx].get("content", "") or "")
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
+                    matched_read_step = None
+                    if tc_call_id is not None:
+                        for r_step in tool_result_steps:
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                matched_read_step = r_step
+                                break
+                    if matched_read_step is None and tc_idx < len(tool_result_steps):
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not (
+                            pos_call_id is not None
+                            and (
+                                (tc_call_id is not None and pos_call_id != tc_call_id)
+                                or pos_call_id in other_call_ids
+                            )
+                        ):
+                            matched_read_step = pos_step
+                    v_len = (
+                        len(matched_read_step.get("content", "") or "")
+                        if matched_read_step is not None
+                        else 0
+                    )
+                    t_file = clean_str(
+                        args.get("Path")
+                        or args.get("AbsolutePath")
+                        or args.get("TargetFile")
+                    )
+                    t_file_posix = t_file.replace("\\", "/")
+                    m_pskill = PLUGIN_SKILL_READ_RE.search(t_file_posix)
+                    if m_pskill:
+                        customization_events.append(
+                            ("plugins", m_pskill.group(1), "skill_read")
+                        )
+                    else:
+                        m_sskill = STANDALONE_SKILL_READ_RE.search(t_file_posix)
+                        if m_sskill:
+                            customization_events.append(
+                                ("skills", m_sskill.group(1), "skill_read")
+                            )
+
                     if is_bounded:
                         file_views_bounded += 1
                         file_views_bounded_chars += v_len
-                        t_file = clean_str(args.get("Path") or args.get("AbsolutePath"))
+                        t_key = norm_path(t_file) or t_file
                         try:
                             s_int = int(s_line)
                             e_int = int(e_line)
-                            file_lines_read_gross[t_file].append((s_int, e_int))
-                            file_lines_read_epoch[t_file].append((s_int, e_int))
+                            file_lines_read_gross[t_key].append((s_int, e_int))
+                            file_lines_read_epoch[t_key].append((s_int, e_int))
                         except Exception:
                             pass
                     else:
                         file_views_unbounded += 1
                         file_views_unbounded_chars += v_len
 
+                elif tname == "call_mcp_tool":
+                    sname = clean_str(
+                        args.get("ServerName")
+                        or args.get("server_name")
+                        or args.get("server")
+                    )
+                    if sname:
+                        customization_events.append(("mcp_servers", sname, "mcp"))
+
+                elif isinstance(tname, str) and tname.startswith("mcp_"):
+                    rem = tname[4:]
+                    for sname in sorted_mcp_servers:
+                        if rem.startswith(sname + "_") and len(rem) > len(sname) + 1:
+                            customization_events.append(("mcp_servers", sname, "mcp"))
+                            break
+
+                elif tname == "invoke_subagent":
+                    aname = clean_str(
+                        args.get("TypeName")
+                        or args.get("type_name")
+                        or args.get("subagent_type")
+                    )
+                    if aname:
+                        customization_events.append(("agents", aname, "agent"))
+
                 elif tname == "run_command":
                     exit_code = None
                     resp_content = ""
-                    # Prefer matching positional tool_result_steps[tc_idx] first, then scan all tool_result_steps
-                    candidate_steps = []
-                    if tc_idx < len(tool_result_steps):
-                        candidate_steps.append((tc_idx, tool_result_steps[tc_idx]))
-                    for r_idx, r_step in enumerate(tool_result_steps):
-                        if r_idx != tc_idx:
-                            candidate_steps.append((r_idx, r_step))
+                    matched_denial_guard = None
+                    tc_call_id = tc.get("id") or tc.get("tool_call_id")
+                    other_call_ids = {
+                        other_id
+                        for other_idx, other_tc in enumerate(tc_list)
+                        if other_idx != tc_idx
+                        for other_id in (
+                            other_tc.get("id") or other_tc.get("tool_call_id"),
+                        )
+                        if other_id is not None
+                    }
 
-                    for r_idx, r_step in candidate_steps:
+                    def _belongs_to_other_call(r_call_id):
+                        if r_call_id is None:
+                            return False
+                        if tc_call_id is not None and r_call_id != tc_call_id:
+                            return True
+                        return r_call_id in other_call_ids
+
+                    # Prefer matching tool_call_id first, then positional tool_result_steps[tc_idx]
+                    # (only when IDs do not conflict or belong to another call in the batch),
+                    # then fallback scan for command-output results only.
+                    candidate_steps = []
+                    if tc_call_id is not None:
+                        for r_idx, r_step in enumerate(tool_result_steps):
+                            r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                            if r_call_id == tc_call_id:
+                                candidate_steps.append((r_idx, r_step, True, True))
+                    if tc_idx < len(tool_result_steps) and not any(
+                        idx == tc_idx for idx, _, _, _ in candidate_steps
+                    ):
+                        pos_step = tool_result_steps[tc_idx]
+                        pos_call_id = pos_step.get("tool_call_id") or pos_step.get("id")
+                        if not _belongs_to_other_call(pos_call_id):
+                            candidate_steps.append((tc_idx, pos_step, True, False))
+                    for r_idx, r_step in enumerate(tool_result_steps):
+                        if any(idx == r_idx for idx, _, _, _ in candidate_steps):
+                            continue
+                        r_call_id = r_step.get("tool_call_id") or r_step.get("id")
+                        if _belongs_to_other_call(r_call_id):
+                            continue
+                        candidate_steps.append((r_idx, r_step, False, False))
+
+                    for r_idx, r_step, is_direct_match, is_id_match in candidate_steps:
                         if r_idx in used_cmd_step_ids:
                             continue
                         m_content = r_step.get("content", "") or ""
+                        denial_g = (
+                            extract_hook_denial_guard(r_step)
+                            if is_direct_match
+                            else None
+                        )
                         if (
-                            "exited with code" in m_content
+                            is_id_match
+                            or "exited with code" in m_content
                             or "finished with result:" in m_content
+                            or denial_g is not None
                         ):
                             used_cmd_step_ids.add(r_idx)
                             resp_content = m_content
-                            m = re.search(r"exited with code (-?\d+)", m_content)
-                            if m:
-                                exit_code = int(m.group(1))
+                            if denial_g is not None:
+                                matched_denial_guard = denial_g
+                                if r_idx not in counted_denial_step_ids:
+                                    counted_denial_step_ids.add(r_idx)
+                                    hook_denials_by_guard[denial_g] += 1
+                            else:
+                                m = re.search(r"exited with code (-?\d+)", m_content)
+                                if m:
+                                    exit_code = int(m.group(1))
                             break
 
+                    raw_cmd = args.get("CommandLine")
+                    raw_cmd_str = raw_cmd.strip() if isinstance(raw_cmd, str) else ""
+                    cmd_str = clean_str(raw_cmd)
+
+                    if matched_denial_guard is not None:
+                        # Hook-denied commands never executed; exclude from CLI/script attribution and runtime failures
+                        continue
+
+                    # Channel 2 customization attribution: CLI-backed plugins and skill scripts
+                    for exe in extract_command_executables(raw_cmd_str):
+                        if exe in effective_cli_to_plugin:
+                            customization_events.append(
+                                (
+                                    "plugins",
+                                    effective_cli_to_plugin[exe],
+                                    "cli_or_script",
+                                )
+                            )
+                    for target_cat, target_name in extract_command_script_targets(
+                        raw_cmd_str
+                    ):
+                        customization_events.append(
+                            (target_cat, target_name, "cli_or_script")
+                        )
+
                     is_failed = False
-                    cmd_str = clean_str(args.get("CommandLine"))
                     if exit_code is not None:
                         if exit_code != 0:
                             if is_benign_command_outcome(
@@ -1006,6 +1912,15 @@ def parse_conversations(
                             "is_command": True,
                         }
                     )
+
+            # Capture any PreToolUse hook denials on non-run_command tool results
+            for r_idx, r_step in enumerate(tool_result_steps):
+                if r_idx in counted_denial_step_ids:
+                    continue
+                denial_g = extract_hook_denial_guard(r_step)
+                if denial_g is not None:
+                    counted_denial_step_ids.add(r_idx)
+                    hook_denials_by_guard[denial_g] += 1
 
         # Infer associated repository
         matched_repo_norm = None
@@ -1165,12 +2080,17 @@ def parse_conversations(
             else 0.0
         )
 
+        session_type = (
+            "interactive" if user_turns_count >= 1 else "subagent_or_headless"
+        )
+
         conversations.append(
             {
                 "id": item.name,
                 "mtime": mtime,
                 "dt": conv_dt,
                 "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "session_type": session_type,
                 "repo_norm": matched_repo_norm,
                 "repo_path": repo_display,
                 "first_prompt": first_prompt,
@@ -1185,7 +2105,19 @@ def parse_conversations(
                     tname: round(chars / 4)
                     for tname, chars in tool_args_chars_by_tool.items()
                 },
+                "tool_call_counts": dict(tool_call_counts),
+                "total_tool_calls": sum(tool_call_counts.values()),
                 "write_to_file_modes": dict(write_to_file_modes),
+                "surgical_edits": surgical_edits_count,
+                "hook_denials_total": sum(hook_denials_by_guard.values()),
+                "hook_denials_by_guard": dict(hook_denials_by_guard),
+                "compactions_count": compactions_count,
+                "model_switches_count": model_switches_count,
+                "persistent_hook_sys_msg_count": persistent_hook_sys_msg_count,
+                "persistent_hook_sys_msg_tokens": round(
+                    persistent_hook_sys_msg_chars / 4
+                ),
+                "customization_events": customization_events,
                 "thinking_tokens": think_tok,
                 "tool_tokens": tool_tok,
                 "run_cmd_tokens": run_cmd_tok,
@@ -1209,6 +2141,7 @@ def parse_conversations(
                     k: round(v / 4) for k, v in ephemeral_by_cat.items()
                 },
                 "api_input_tokens": api_input_tokens,
+                "api_cache_creation_tokens": api_cache_creation_tokens,
                 "api_cache_read_tokens": api_cache_read_tokens,
                 "api_output_tokens": api_output_tokens,
                 "has_api_tokens": has_api_tokens,
@@ -1225,11 +2158,14 @@ def parse_conversations(
                 "model": model_changes[-1] if model_changes else "unknown",
             }
         )
-        if compare_mode and since_dt:
-            if conv_dt >= since_dt:
-                target_count += 1
-            else:
-                baseline_count += 1
+        is_counted_conv = headless_in_primary or (session_type == "interactive")
+        if is_counted_conv and not primary_quota_full:
+            primary_count += 1
+            if compare_mode and since_dt:
+                if conv_dt >= since_dt:
+                    target_count += 1
+                else:
+                    baseline_count += 1
 
     # Carry forward active model selection in chronological order across discovered + parsed sessions
     unselected_events = [
@@ -1270,7 +2206,7 @@ def quantile(data, q):
     return s[low] * (1 - weight) + s[high] * weight
 
 
-def calculate_cohort_summary(conv_list):
+def calculate_cohort_summary(conv_list, installed_customizations=None):
     total_convs = len(conv_list)
     total_user_turns = sum(c["user_turns"] for c in conv_list)
     total_commands = sum(len(c["commands"]) for c in conv_list)
@@ -1386,8 +2322,55 @@ def calculate_cohort_summary(conv_list):
     )
 
     write_to_file_totals = Counter()
+    tool_call_counts_totals = Counter()
+    hook_denials_by_guard_totals = Counter()
     for c in conv_list:
         write_to_file_totals.update(c.get("write_to_file_modes", {}))
+        tool_call_counts_totals.update(c.get("tool_call_counts", {}))
+        hook_denials_by_guard_totals.update(c.get("hook_denials_by_guard", {}))
+
+    total_tool_calls = sum(tool_call_counts_totals.values())
+    total_hook_denials = sum(hook_denials_by_guard_totals.values())
+    hook_denials_per_100_tools = (
+        round(total_hook_denials / total_tool_calls * 100, 2)
+        if total_tool_calls > 0
+        else 0.0
+    )
+    surgical_edits = sum(
+        c["surgical_edits"]
+        if "surgical_edits" in c
+        else sum(c.get("tool_call_counts", {}).get(t, 0) for t in EDIT_TOOLS)
+        for c in conv_list
+    )
+    full_overwrites = write_to_file_totals.get("overwrite", 0)
+    surgical_edit_ratio_pct = (
+        round(surgical_edits / (surgical_edits + full_overwrites) * 100, 2)
+        if (surgical_edits + full_overwrites) > 0
+        else 0.0
+    )
+
+    total_compactions = sum(c.get("compactions_count", 0) for c in conv_list)
+    convs_with_compaction = sum(
+        1 for c in conv_list if c.get("compactions_count", 0) > 0
+    )
+    long_convs_without_compaction = sum(
+        1
+        for c in conv_list
+        if c.get("user_turns", 0) >= 15 and c.get("compactions_count", 0) == 0
+    )
+    total_model_switches = sum(c.get("model_switches_count", 0) for c in conv_list)
+    convs_with_model_switch = sum(
+        1 for c in conv_list if c.get("model_switches_count", 0) > 0
+    )
+    total_persistent_sys_msgs = sum(
+        c.get("persistent_hook_sys_msg_count", 0) for c in conv_list
+    )
+    total_persistent_sys_msg_tokens = sum(
+        c.get("persistent_hook_sys_msg_tokens", 0) for c in conv_list
+    )
+    customization_usage = aggregate_customization_usage(
+        conv_list, installed=installed_customizations
+    )
 
     missing_dep_repos = Counter()
     missing_dep_convs = Counter()
@@ -1430,12 +2413,14 @@ def calculate_cohort_summary(conv_list):
     api_convs = [c for c in conv_list if c.get("has_api_tokens", False)]
     num_api_convs = len(api_convs)
     api_user_turns = sum(c["user_turns"] for c in api_convs)
-    total_api_input_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
+    total_api_input_raw_tok = sum(c.get("api_input_tokens", 0) for c in conv_list)
+    total_api_cache_creation_tok = sum(
+        c.get("api_cache_creation_tokens", 0) for c in conv_list
+    )
+    total_api_input_tok = total_api_input_raw_tok + total_api_cache_creation_tok
     total_api_cache_read_tok = sum(c.get("api_cache_read_tokens", 0) for c in conv_list)
     total_api_output_tok = sum(c.get("api_output_tokens", 0) for c in conv_list)
-    has_api_gt = num_api_convs > 0 and (
-        total_api_input_tok > 0 or total_api_cache_read_tok > 0
-    )
+    has_api_gt = num_api_convs > 0
     total_api_context_processed = total_api_input_tok + total_api_cache_read_tok
     total_api_tokens_all = total_api_context_processed + total_api_output_tok
 
@@ -1611,6 +2596,33 @@ def calculate_cohort_summary(conv_list):
             "overlap_pct": unmodified_overlap_ratio,
         },
         "write_to_file_modes": dict(write_to_file_totals),
+        "tool_call_counts": dict(tool_call_counts_totals),
+        "total_tool_calls": total_tool_calls,
+        "surgical_edits": surgical_edits,
+        "surgical_edit_ratio_pct": surgical_edit_ratio_pct,
+        "hook_denials": {
+            "total": total_hook_denials,
+            "per_100_tool_calls": hook_denials_per_100_tools,
+            "by_guard": dict(hook_denials_by_guard_totals),
+        },
+        "cache_drift_diagnostics": {
+            "compactions_total": total_compactions,
+            "convs_with_compaction": convs_with_compaction,
+            "long_convs_without_compaction": long_convs_without_compaction,
+            "model_switches_total": total_model_switches,
+            "convs_with_model_switch": convs_with_model_switch,
+            "persistent_hook_system_messages": {
+                "count": total_persistent_sys_msgs,
+                "tokens": total_persistent_sys_msg_tokens,
+                "per_conv": round(total_persistent_sys_msgs / total_convs, 2)
+                if total_convs > 0
+                else 0.0,
+                "tokens_per_conv": round(total_persistent_sys_msg_tokens / total_convs)
+                if total_convs > 0
+                else 0,
+            },
+        },
+        "customization_usage": customization_usage,
         "missing_dependency_details": {
             "by_repo": dict(missing_dep_repos),
             "by_conv": dict(missing_dep_convs),
@@ -1649,6 +2661,9 @@ def calculate_cohort_summary(conv_list):
         "api_tokens_ground_truth": {
             "has_ground_truth": has_api_gt,
             "input_tokens_fresh": total_api_input_tok if has_api_gt else None,
+            "cache_creation_input_tokens": total_api_cache_creation_tok
+            if has_api_gt
+            else None,
             "cache_read_tokens": total_api_cache_read_tok if has_api_gt else None,
             "output_tokens_model": total_api_output_tok if has_api_gt else None,
             "total_api_context_processed": total_api_context_processed
@@ -1854,6 +2869,21 @@ def run_inventory(output_dir=None):
     return out_file
 
 
+def _total_api_tokens_for_convs(conv_list):
+    total = 0
+    has_gt = False
+    for c in conv_list:
+        if c.get("has_api_tokens"):
+            has_gt = True
+            total += (
+                (c.get("api_input_tokens", 0) or 0)
+                + (c.get("api_cache_creation_tokens", 0) or 0)
+                + (c.get("api_cache_read_tokens", 0) or 0)
+                + (c.get("api_output_tokens", 0) or 0)
+            )
+    return total if has_gt else None
+
+
 def run_audit(
     output_dir=None,
     max_conversations=100,
@@ -1867,6 +2897,8 @@ def run_audit(
     print_summary=False,
     include_conv=None,
     baseline_since_date=None,
+    include_subagents=False,
+    config_dir=None,
 ):
     base_dir = locate_antigravity_dir()
     brain_dirs = locate_brain_directories(base_dir)
@@ -1986,6 +3018,7 @@ def run_audit(
 
     ide_workspaces = discover_ide_workspaces(ws_storage_dir)
     candidate_repos = discover_git_repositories(ide_workspaces, base_dir)
+    installed_customizations = discover_installed_customizations(config_dir=config_dir)
 
     all_convs, total_candidates = parse_conversations(
         brain_dirs=brain_dirs,
@@ -2000,7 +3033,18 @@ def run_audit(
         baseline_since_dt=baseline_since_dt,
         auto_exclude_audit=auto_exclude_audit,
         compare_mode=compare_mode,
+        include_subagents=include_subagents,
+        cli_to_plugin=installed_customizations.get("cli_to_plugin"),
+        mcp_server_names=list(installed_customizations.get("mcp_servers", {}).keys()),
     )
+
+    interactive_convs_all = [
+        c for c in all_convs if c.get("session_type") == "interactive"
+    ]
+    subagent_convs_all = [
+        c for c in all_convs if c.get("session_type") != "interactive"
+    ]
+    total_api_tokens_incl_subagents = _total_api_tokens_for_convs(all_convs)
 
     out_dir = Path(output_dir) if output_dir else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2008,19 +3052,48 @@ def run_audit(
 
     if compare_mode and since_dt:
         # Partition conversations by start timestamp
-        target_convs = [c for c in all_convs if c["dt"] >= since_dt]
-        baseline_convs = [
+        target_all = [c for c in all_convs if c["dt"] >= since_dt]
+        baseline_all = [
             c
             for c in all_convs
             if c["dt"] < since_dt
             and (not baseline_since_dt or c["dt"] >= baseline_since_dt)
         ]
+        if include_subagents or include_conv_list:
+            target_convs = list(target_all)
+            baseline_convs = list(baseline_all)
+        else:
+            target_convs = [
+                c for c in target_all if c.get("session_type") == "interactive"
+            ]
+            baseline_convs = [
+                c for c in baseline_all if c.get("session_type") == "interactive"
+            ]
+        target_subagent_convs = [
+            c for c in target_all if c.get("session_type") != "interactive"
+        ]
+        baseline_subagent_convs = [
+            c for c in baseline_all if c.get("session_type") != "interactive"
+        ]
         if max_conversations and max_conversations > 0:
             target_convs = target_convs[:max_conversations]
             baseline_convs = baseline_convs[:max_conversations]
 
-        target_summary = calculate_cohort_summary(target_convs)
-        baseline_summary = calculate_cohort_summary(baseline_convs)
+        target_summary = calculate_cohort_summary(
+            target_convs, installed_customizations=installed_customizations
+        )
+        baseline_summary = calculate_cohort_summary(
+            baseline_convs, installed_customizations=installed_customizations
+        )
+        target_subagent_summary = calculate_cohort_summary(
+            target_subagent_convs, installed_customizations=installed_customizations
+        )
+        baseline_subagent_summary = calculate_cohort_summary(
+            baseline_subagent_convs, installed_customizations=installed_customizations
+        )
+        subagent_summary_all = calculate_cohort_summary(
+            subagent_convs_all, installed_customizations=installed_customizations
+        )
 
         print(
             f"\nParsed Conversations: {len(target_convs)} target (post {since_dt.strftime('%Y-%m-%d %H:%M')}) vs {len(baseline_convs)} baseline"
@@ -2145,6 +3218,7 @@ def run_audit(
             (
                 c.get("api_cache_read_tokens", 0) or 0,
                 (c.get("api_input_tokens", 0) or 0)
+                + (c.get("api_cache_creation_tokens", 0) or 0)
                 + (c.get("api_cache_read_tokens", 0) or 0),
             )
             for c in t_api_convs
@@ -2153,6 +3227,7 @@ def run_audit(
             (
                 c.get("api_cache_read_tokens", 0) or 0,
                 (c.get("api_input_tokens", 0) or 0)
+                + (c.get("api_cache_creation_tokens", 0) or 0)
                 + (c.get("api_cache_read_tokens", 0) or 0),
             )
             for c in b_api_convs
@@ -2160,17 +3235,27 @@ def run_audit(
 
         t_api_context = [
             (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_creation_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
             for c in t_api_convs
         ]
         b_api_context = [
             (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_creation_tokens", 0) or 0)
             + (c.get("api_cache_read_tokens", 0) or 0)
             for c in b_api_convs
         ]
 
-        t_api_fresh = [c.get("api_input_tokens", 0) or 0 for c in t_api_convs]
-        b_api_fresh = [c.get("api_input_tokens", 0) or 0 for c in b_api_convs]
+        t_api_fresh = [
+            (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_creation_tokens", 0) or 0)
+            for c in t_api_convs
+        ]
+        b_api_fresh = [
+            (c.get("api_input_tokens", 0) or 0)
+            + (c.get("api_cache_creation_tokens", 0) or 0)
+            for c in b_api_convs
+        ]
 
         # Conversation-level non-parametric bootstrap tests (1,000 resamples)
         _, _, p_fail, sig_fail = bootstrap_conversation_diff(
@@ -2313,10 +3398,20 @@ def run_audit(
             val_suffix="%",
             is_significant=sig_cache,
         )
+        b_api_ctx = (
+            base_api["context_per_conv"]
+            if base_api.get("context_per_conv") is not None
+            else base_api.get("total_api_per_conv")
+        )
+        t_api_ctx = (
+            tgt_api["context_per_conv"]
+            if tgt_api.get("context_per_conv") is not None
+            else tgt_api.get("total_api_per_conv")
+        )
         print_row(
             "API Context / Conv (Ground Truth)",
-            base_api.get("context_per_conv") or base_api.get("total_api_per_conv"),
-            tgt_api.get("context_per_conv") or tgt_api.get("total_api_per_conv"),
+            b_api_ctx,
+            t_api_ctx,
             lower_is_better=True,
             is_significant=sig_api_context,
         )
@@ -2362,6 +3457,11 @@ def run_audit(
             "audit_timestamp": datetime.now().isoformat(),
             "platform": platform.system(),
             "mode": "comparative",
+            "include_subagents": include_subagents,
+            "interactive_conversations": len(interactive_convs_all),
+            "subagent_or_headless_conversations": len(subagent_convs_all),
+            "total_api_tokens_including_subagents": total_api_tokens_incl_subagents,
+            "subagent_summary": subagent_summary_all,
             "since_filter": since_dt.isoformat() if since_dt else None,
             "baseline_since_filter": baseline_since_dt.isoformat()
             if baseline_since_dt
@@ -2371,6 +3471,14 @@ def run_audit(
                 "target_window": target_summary,
                 "baseline_window": baseline_summary,
                 "baseline": baseline_summary,
+                "target_subagent_summary": target_subagent_summary,
+                "baseline_subagent_summary": baseline_subagent_summary,
+                "target_total_api_tokens_including_subagents": _total_api_tokens_for_convs(
+                    target_all
+                ),
+                "baseline_total_api_tokens_including_subagents": _total_api_tokens_for_convs(
+                    baseline_all
+                ),
                 "bootstrap_significance_tests": {
                     "unit_of_analysis": "conversation",
                     "iterations": 1000,
@@ -2410,13 +3518,31 @@ def run_audit(
             },
         }
     else:
-        summary = calculate_cohort_summary(all_convs)
+        primary_convs = (
+            all_convs
+            if (include_subagents or include_conv_list)
+            else interactive_convs_all
+        )
+        if max_conversations and max_conversations > 0:
+            primary_convs = primary_convs[:max_conversations]
+        summary = calculate_cohort_summary(
+            primary_convs, installed_customizations=installed_customizations
+        )
+        subagent_summary = calculate_cohort_summary(
+            subagent_convs_all, installed_customizations=installed_customizations
+        )
         print(
-            f"\nParsed Active Conversations: {summary['conversations']} (out of {total_candidates} matching candidates)"
+            f"\nParsed Active Conversations: {len(interactive_convs_all)} interactive "
+            f"(+ {len(subagent_convs_all)} subagent/headless, {summary['conversations']} in primary summary, "
+            f"out of {total_candidates} matching candidates)"
         )
         print(f"Total Commands Executed: {summary['commands']}")
         print(
             f"True Command Failures: {summary['failures']} ({summary['failure_rate_pct']:.2f}% true failure rate)"
+        )
+        print(
+            f"PreToolUse Hook Denials: {summary['hook_denials']['total']} "
+            f"({summary['hook_denials']['per_100_tool_calls']:.2f} per 100 tool calls)"
         )
         print(f"Total Incident Chains: {summary['total_incidents']}")
         print(f"High-Friction Loops: {summary['high_friction_count']}")
@@ -2443,6 +3569,11 @@ def run_audit(
             "audit_timestamp": datetime.now().isoformat(),
             "platform": platform.system(),
             "mode": "standard",
+            "include_subagents": include_subagents,
+            "interactive_conversations": len(interactive_convs_all),
+            "subagent_or_headless_conversations": len(subagent_convs_all),
+            "total_api_tokens_including_subagents": total_api_tokens_incl_subagents,
+            "subagent_summary": subagent_summary,
             "since_filter": since_dt.isoformat() if since_dt else None,
             "baseline_since_filter": baseline_since_dt.isoformat()
             if baseline_since_dt
@@ -2454,7 +3585,10 @@ def run_audit(
 
     if include_conv_list:
         summary_payload["per_conversation"] = {
-            c["id"]: calculate_cohort_summary([c]) for c in all_convs
+            c["id"]: calculate_cohort_summary(
+                [c], installed_customizations=installed_customizations
+            )
+            for c in all_convs
         }
 
     with open(out_file, "w", encoding="utf-8") as f:
@@ -2531,6 +3665,12 @@ if __name__ == "__main__":
         help="Include self and audit/meta-evaluation sessions (default: excluded)",
     )
     parser.add_argument(
+        "--include-subagents",
+        action="store_true",
+        default=False,
+        help="Include subagent/headless sessions (user_turns == 0) in primary metrics (default: separated into subagent_summary)",
+    )
+    parser.add_argument(
         "--inventory-only",
         action="store_true",
         help="Discover repositories and date boundaries rapidly without parsing transcripts",
@@ -2564,4 +3704,5 @@ if __name__ == "__main__":
             auto_exclude_audit=not args.include_audit_sessions,
             compare_mode=args.compare,
             print_summary=args.print_summary,
+            include_subagents=args.include_subagents,
         )
